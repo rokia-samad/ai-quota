@@ -20,4 +20,6 @@ Pour créer l’app autonome sans dépendre du Terminal :
 zsh scripts/build-app.sh
 ```
 
+Le build convertit automatiquement `Assets/codex-quota-icon.png` au format `.icns` et l’intègre comme icône de l’app.
+
 Prérequis : Codex / ChatGPT Desktop installé et connecté.
