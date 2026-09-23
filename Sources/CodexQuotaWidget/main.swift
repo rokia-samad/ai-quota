@@ -290,6 +290,14 @@ private actor CodexAppServerClient {
 
 if CommandLine.arguments.contains("--claude-statusline") {
     ClaudeBridge.captureStatusLine()
+} else if CommandLine.arguments.contains("--install-claude-statusline") {
+    do {
+        try ClaudeBridge.installStatusLine()
+        print("Ligne de statut Claude Code activée.")
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+        exit(EXIT_FAILURE)
+    }
 } else {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
