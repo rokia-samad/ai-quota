@@ -145,6 +145,7 @@ private final class QuotaController: NSObject {
     private let secondaryStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let codexItem = NSMenuItem(title: "Codex : connexion…", action: nil, keyEquivalent: "")
     private let claudeItem = NSMenuItem(title: "Claude : en attente d’une session", action: nil, keyEquivalent: "")
+    private let countdownItem = NSMenuItem(title: "Prochain changement : 10 s", action: nil, keyEquivalent: "")
     private let client = CodexAppServerClient()
     private var refreshTimer: Timer?
     private var cycleTimer: Timer?
@@ -154,7 +155,14 @@ private final class QuotaController: NSObject {
     private var windowMode = WindowMode(rawValue: UserDefaults.standard.string(forKey: "quotaWindowMode") ?? "") ?? .both
     private var cycleSeconds: Int = {
         let saved = UserDefaults.standard.integer(forKey: "quotaCycleSeconds")
-        return [5, 10, 20].contains(saved) ? saved : 10
+        return (2...300).contains(saved) ? saved : 10
+    }()
+    private var remainingCycleSeconds = 10
+    private var showCountdown = UserDefaults.standard.bool(forKey: "quotaShowCountdown")
+    private var refreshEnabled = UserDefaults.standard.object(forKey: "quotaRefreshEnabled") as? Bool ?? true
+    private var refreshSeconds: Int = {
+        let saved = UserDefaults.standard.integer(forKey: "quotaRefreshSeconds")
+        return [30, 60, 300].contains(saved) ? saved : 60
     }()
     private var currentProvider: Provider = .codex
     private lazy var codexIcon = providerIcon(.codex)
@@ -225,6 +233,8 @@ private final class QuotaController: NSObject {
         menu.setSubmenu(windowMenu, for: menu.addItem(withTitle: "Quotas affichés", action: nil, keyEquivalent: ""))
 
         let speedMenu = NSMenu()
+        speedMenu.addItem(countdownItem)
+        speedMenu.addItem(.separator())
         for (title, selector) in [
             ("Toutes les 5 secondes", #selector(cycleEvery5)),
             ("Toutes les 10 secondes", #selector(cycleEvery10)),
@@ -234,7 +244,23 @@ private final class QuotaController: NSObject {
             item.target = self
             speedMenu.addItem(item)
         }
+        speedMenu.addItem(withTitle: "Durée personnalisée…", action: #selector(customizeCycle), keyEquivalent: "").target = self
+        speedMenu.addItem(.separator())
+        speedMenu.addItem(withTitle: "Afficher le compte à rebours", action: #selector(toggleCountdown), keyEquivalent: "").target = self
         menu.setSubmenu(speedMenu, for: menu.addItem(withTitle: "Vitesse du défilement", action: nil, keyEquivalent: ""))
+
+        let refreshMenu = NSMenu()
+        for (title, selector) in [
+            ("Activée", #selector(toggleAutoRefresh)),
+            ("Toutes les 30 secondes", #selector(refreshEvery30)),
+            ("Toutes les 1 minute", #selector(refreshEvery60)),
+            ("Toutes les 5 minutes", #selector(refreshEvery300))
+        ] {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            refreshMenu.addItem(item)
+        }
+        menu.setSubmenu(refreshMenu, for: menu.addItem(withTitle: "Actualisation automatique", action: nil, keyEquivalent: ""))
 
         menu.addItem(withTitle: "Relier Claude Code (terminal)", action: #selector(enableClaude), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Actualiser", action: #selector(refresh), keyEquivalent: "r").target = self
@@ -252,11 +278,14 @@ private final class QuotaController: NSObject {
             }
             await refreshAsync()
         }
-        refreshTimer = Timer.scheduledTimer(timeInterval: 60, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
+        startRefreshTimer()
         startCycleTimer()
     }
 
-    @objc private func refresh() { Task { await refreshAsync() } }
+    @objc private func refresh() {
+        render()
+        Task { await refreshAsync() }
+    }
     @objc private func showAvailable() { displayMode = .available; saveDisplayMode() }
     @objc private func showUsed() { displayMode = .used; saveDisplayMode() }
     private func saveDisplayMode() { UserDefaults.standard.set(displayMode.rawValue, forKey: "quotaDisplayMode"); render() }
@@ -270,6 +299,7 @@ private final class QuotaController: NSObject {
         providerMode = mode
         currentProvider = .codex
         UserDefaults.standard.set(mode.rawValue, forKey: "quotaProviderMode")
+        startCycleTimer()
         render()
     }
 
@@ -287,6 +317,34 @@ private final class QuotaController: NSObject {
     @objc private func cycleEvery10() { setCycleSeconds(10) }
     @objc private func cycleEvery20() { setCycleSeconds(20) }
 
+    @objc private func customizeCycle() {
+        let alert = NSAlert()
+        alert.messageText = "Durée du défilement"
+        alert.informativeText = "Choisis un nombre de secondes entre 2 et 300."
+        alert.addButton(withTitle: "Enregistrer")
+        alert.addButton(withTitle: "Annuler")
+        let field = NSTextField(string: String(cycleSeconds))
+        field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
+        alert.accessoryView = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let seconds = Int(value), (2...300).contains(seconds) else {
+            let error = NSAlert()
+            error.messageText = "Durée invalide"
+            error.informativeText = "Saisis un nombre entier entre 2 et 300 secondes."
+            error.runModal()
+            return
+        }
+        setCycleSeconds(seconds)
+    }
+
+    @objc private func toggleCountdown() {
+        showCountdown.toggle()
+        UserDefaults.standard.set(showCountdown, forKey: "quotaShowCountdown")
+        render()
+    }
+
     private func setCycleSeconds(_ seconds: Int) {
         cycleSeconds = seconds
         UserDefaults.standard.set(seconds, forKey: "quotaCycleSeconds")
@@ -296,14 +354,58 @@ private final class QuotaController: NSObject {
 
     private func startCycleTimer() {
         cycleTimer?.invalidate()
-        cycleTimer = Timer.scheduledTimer(timeInterval: TimeInterval(cycleSeconds), target: self, selector: #selector(advanceProvider), userInfo: nil, repeats: true)
+        remainingCycleSeconds = cycleSeconds
+        guard providerMode == .alternating else {
+            countdownItem.title = "Défilement inactif"
+            return
+        }
+        countdownItem.title = "Prochain changement : \(remainingCycleSeconds) s"
+        let timer = Timer(timeInterval: 1, target: self, selector: #selector(advanceProvider), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .common)
+        cycleTimer = timer
     }
 
     @objc private func advanceProvider() {
-        if providerMode == .alternating {
+        guard providerMode == .alternating else { return }
+        remainingCycleSeconds -= 1
+        if remainingCycleSeconds <= 0 {
             currentProvider = currentProvider == .codex ? .claude : .codex
+            remainingCycleSeconds = cycleSeconds
+            render()
+        } else if showCountdown {
+            render()
         }
+        countdownItem.title = "Prochain changement : \(remainingCycleSeconds) s"
+    }
+
+    @objc private func toggleAutoRefresh() {
+        refreshEnabled.toggle()
+        UserDefaults.standard.set(refreshEnabled, forKey: "quotaRefreshEnabled")
+        startRefreshTimer()
+        if refreshEnabled { refresh() }
         render()
+    }
+
+    @objc private func refreshEvery30() { setRefreshSeconds(30) }
+    @objc private func refreshEvery60() { setRefreshSeconds(60) }
+    @objc private func refreshEvery300() { setRefreshSeconds(300) }
+
+    private func setRefreshSeconds(_ seconds: Int) {
+        refreshSeconds = seconds
+        refreshEnabled = true
+        UserDefaults.standard.set(seconds, forKey: "quotaRefreshSeconds")
+        UserDefaults.standard.set(true, forKey: "quotaRefreshEnabled")
+        startRefreshTimer()
+        refresh()
+        render()
+    }
+
+    private func startRefreshTimer() {
+        refreshTimer?.invalidate()
+        guard refreshEnabled else { return }
+        let timer = Timer(timeInterval: TimeInterval(refreshSeconds), target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
     }
 
     @objc private func enableClaude() {
@@ -345,6 +447,13 @@ private final class QuotaController: NSObject {
         speedMenu?.item(withTitle: "Toutes les 5 secondes")?.state = cycleSeconds == 5 ? .on : .off
         speedMenu?.item(withTitle: "Toutes les 10 secondes")?.state = cycleSeconds == 10 ? .on : .off
         speedMenu?.item(withTitle: "Toutes les 20 secondes")?.state = cycleSeconds == 20 ? .on : .off
+        speedMenu?.item(withTitle: "Durée personnalisée…")?.state = [5, 10, 20].contains(cycleSeconds) ? .off : .on
+        speedMenu?.item(withTitle: "Afficher le compte à rebours")?.state = showCountdown ? .on : .off
+        let refreshMenu = menu.item(withTitle: "Actualisation automatique")?.submenu
+        refreshMenu?.item(withTitle: "Activée")?.state = refreshEnabled ? .on : .off
+        refreshMenu?.item(withTitle: "Toutes les 30 secondes")?.state = refreshSeconds == 30 ? .on : .off
+        refreshMenu?.item(withTitle: "Toutes les 1 minute")?.state = refreshSeconds == 60 ? .on : .off
+        refreshMenu?.item(withTitle: "Toutes les 5 minutes")?.state = refreshSeconds == 300 ? .on : .off
 
         func texts(for provider: Provider) -> (String, String) {
             let sessionUsed = provider == .codex ? codexSession?.usedPercent : claude?.sessionUsed
@@ -376,6 +485,9 @@ private final class QuotaController: NSObject {
         switch providerMode {
         case .alternating:
             show(currentProvider, on: primaryStatusItem)
+            if showCountdown, let button = primaryStatusItem.button {
+                button.title += " · \(remainingCycleSeconds)s"
+            }
             secondaryStatusItem.isVisible = false
         case .both:
             show(.codex, on: primaryStatusItem)
