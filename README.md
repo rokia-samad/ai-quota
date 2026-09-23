@@ -27,9 +27,10 @@ L’app affiche par exemple `logo bleu 5h 84% · 7j 80%`, puis `logo orange 5h 8
 - **Afficher** : pourcentage **disponible** ou **utilisé**.
 - **Services affichés** : défilement automatique, les deux côte à côte, ChatGPT seulement ou Claude seulement.
 - **Quotas affichés** : 5 h et 7 j, 5 h seulement ou 7 j seulement.
-- **Vitesse du défilement** : toutes les 5, 10 ou 20 secondes.
+- **Vitesse du défilement** : toutes les 5, 10 ou 20 secondes, ou une durée personnalisée de 2 à 300 secondes. Le menu affiche le temps restant avant le prochain changement ; tu peux aussi afficher ce compte à rebours dans la barre de menus.
+- **Actualisation automatique** : activée par défaut, avec une fréquence de 30 secondes, 1 minute ou 5 minutes. « Actualiser » reste disponible à tout moment.
 
-Ces choix sont mémorisés. Le défilement automatique passe d’un service à l’autre toutes les 10 secondes par défaut.
+Ces choix sont mémorisés. Le défilement automatique passe d’un service à l’autre toutes les 10 secondes par défaut ; les données sont relues chaque minute par défaut.
 
 Pour Claude Desktop, le widget lit automatiquement la dernière mesure locale enregistrée par l’app. Pour Claude Code dans le terminal, le menu « Relier Claude Code (terminal) » configure sa [ligne de statut officielle](https://code.claude.com/docs/en/statusline). Si une ligne de statut personnalisée existe déjà, l'app ne la remplace pas ; intègre alors la commande `CodexQuotaWidget --claude-statusline` à ton script existant en lui transmettant son JSON d'entrée.
 
