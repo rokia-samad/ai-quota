@@ -136,32 +136,52 @@ private enum ClaudeBridge {
 @MainActor
 private final class QuotaController: NSObject {
     private enum DisplayMode: String { case available, used }
-    private enum Provider: CaseIterable { case codex, claude }
+    private enum Provider { case codex, claude }
+    private enum ProviderMode: String { case alternating, both, codex, claude }
+    private enum WindowMode: String { case both, session, weekly }
 
     private let menu = NSMenu()
-    private var statusItems: [Provider: NSStatusItem] = [:]
+    private let primaryStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let secondaryStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let codexItem = NSMenuItem(title: "Codex : connexion…", action: nil, keyEquivalent: "")
     private let claudeItem = NSMenuItem(title: "Claude : en attente d’une session", action: nil, keyEquivalent: "")
     private let client = CodexAppServerClient()
-    private var timer: Timer?
+    private var refreshTimer: Timer?
+    private var cycleTimer: Timer?
     private var codexLimits: RateLimitResponse?
     private var displayMode: DisplayMode = UserDefaults.standard.string(forKey: "quotaDisplayMode") == "used" ? .used : .available
+    private var providerMode = ProviderMode(rawValue: UserDefaults.standard.string(forKey: "quotaProviderMode") ?? "") ?? .alternating
+    private var windowMode = WindowMode(rawValue: UserDefaults.standard.string(forKey: "quotaWindowMode") ?? "") ?? .both
+    private var cycleSeconds: Int = {
+        let saved = UserDefaults.standard.integer(forKey: "quotaCycleSeconds")
+        return [5, 10, 20].contains(saved) ? saved : 10
+    }()
+    private var currentProvider: Provider = .codex
+    private lazy var codexIcon = providerIcon(.codex)
+    private lazy var claudeIcon = providerIcon(.claude)
 
     private func providerIcon(_ provider: Provider) -> NSImage? {
         let path = provider == .codex
             ? "/Applications/ChatGPT.app/Contents/Resources/chatgptTemplate@2x.png"
             : "/Applications/Claude.app/Contents/Resources/TrayIconTemplate@2x.png"
         guard let source = NSImage(contentsOfFile: path) else { return nil }
-        let size = NSSize(width: 16, height: 16)
+        let size = NSSize(width: 17, height: 17)
         let bounds = NSRect(origin: .zero, size: size)
+        let glyph = NSImage(size: size)
+        glyph.lockFocus()
+        source.draw(in: NSRect(x: 2.5, y: 2.5, width: 12, height: 12))
+        NSColor.white.setFill()
+        bounds.fill(using: .sourceIn)
+        glyph.unlockFocus()
+
         let image = NSImage(size: size)
         image.lockFocus()
-        source.draw(in: bounds)
         let color = provider == .codex
             ? NSColor(red: 0.16, green: 0.52, blue: 0.96, alpha: 1)
             : NSColor(red: 0.86, green: 0.43, blue: 0.28, alpha: 1)
         color.setFill()
-        bounds.fill(using: .sourceIn)
+        NSBezierPath(ovalIn: bounds.insetBy(dx: 0.5, dy: 0.5)).fill()
+        glyph.draw(in: bounds)
         image.unlockFocus()
         image.isTemplate = false
         return image
@@ -178,17 +198,52 @@ private final class QuotaController: NSObject {
             displayMenu.addItem(item)
         }
         menu.setSubmenu(displayMenu, for: menu.addItem(withTitle: "Afficher", action: nil, keyEquivalent: ""))
+
+        let providerMenu = NSMenu()
+        for (title, selector) in [
+            ("Défilement automatique", #selector(showAlternating)),
+            ("ChatGPT et Claude côte à côte", #selector(showBothProviders)),
+            ("ChatGPT seulement", #selector(showCodexOnly)),
+            ("Claude seulement", #selector(showClaudeOnly))
+        ] {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            providerMenu.addItem(item)
+        }
+        menu.setSubmenu(providerMenu, for: menu.addItem(withTitle: "Services affichés", action: nil, keyEquivalent: ""))
+
+        let windowMenu = NSMenu()
+        for (title, selector) in [
+            ("5 h et 7 j", #selector(showBothWindows)),
+            ("5 h seulement", #selector(showSessionOnly)),
+            ("7 j seulement", #selector(showWeeklyOnly))
+        ] {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            windowMenu.addItem(item)
+        }
+        menu.setSubmenu(windowMenu, for: menu.addItem(withTitle: "Quotas affichés", action: nil, keyEquivalent: ""))
+
+        let speedMenu = NSMenu()
+        for (title, selector) in [
+            ("Toutes les 5 secondes", #selector(cycleEvery5)),
+            ("Toutes les 10 secondes", #selector(cycleEvery10)),
+            ("Toutes les 20 secondes", #selector(cycleEvery20))
+        ] {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            speedMenu.addItem(item)
+        }
+        menu.setSubmenu(speedMenu, for: menu.addItem(withTitle: "Vitesse du défilement", action: nil, keyEquivalent: ""))
+
         menu.addItem(withTitle: "Relier Claude Code (terminal)", action: #selector(enableClaude), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Actualiser", action: #selector(refresh), keyEquivalent: "r").target = self
         menu.addItem(withTitle: "Quitter Quota Widget", action: #selector(quit), keyEquivalent: "q").target = self
 
-        for provider in Provider.allCases {
-            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-            item.button?.image = providerIcon(provider)
-            item.button?.imagePosition = .imageLeading
-            item.menu = menu
-            statusItems[provider] = item
-        }
+        primaryStatusItem.menu = menu
+        secondaryStatusItem.menu = menu
+        primaryStatusItem.button?.imagePosition = .imageLeading
+        secondaryStatusItem.button?.imagePosition = .imageLeading
         render()
         Task { [weak self] in
             guard let self else { return }
@@ -197,13 +252,59 @@ private final class QuotaController: NSObject {
             }
             await refreshAsync()
         }
-        timer = Timer.scheduledTimer(timeInterval: 60, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
+        refreshTimer = Timer.scheduledTimer(timeInterval: 60, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
+        startCycleTimer()
     }
 
     @objc private func refresh() { Task { await refreshAsync() } }
     @objc private func showAvailable() { displayMode = .available; saveDisplayMode() }
     @objc private func showUsed() { displayMode = .used; saveDisplayMode() }
     private func saveDisplayMode() { UserDefaults.standard.set(displayMode.rawValue, forKey: "quotaDisplayMode"); render() }
+
+    @objc private func showAlternating() { setProviderMode(.alternating) }
+    @objc private func showBothProviders() { setProviderMode(.both) }
+    @objc private func showCodexOnly() { setProviderMode(.codex) }
+    @objc private func showClaudeOnly() { setProviderMode(.claude) }
+
+    private func setProviderMode(_ mode: ProviderMode) {
+        providerMode = mode
+        currentProvider = .codex
+        UserDefaults.standard.set(mode.rawValue, forKey: "quotaProviderMode")
+        render()
+    }
+
+    @objc private func showBothWindows() { setWindowMode(.both) }
+    @objc private func showSessionOnly() { setWindowMode(.session) }
+    @objc private func showWeeklyOnly() { setWindowMode(.weekly) }
+
+    private func setWindowMode(_ mode: WindowMode) {
+        windowMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "quotaWindowMode")
+        render()
+    }
+
+    @objc private func cycleEvery5() { setCycleSeconds(5) }
+    @objc private func cycleEvery10() { setCycleSeconds(10) }
+    @objc private func cycleEvery20() { setCycleSeconds(20) }
+
+    private func setCycleSeconds(_ seconds: Int) {
+        cycleSeconds = seconds
+        UserDefaults.standard.set(seconds, forKey: "quotaCycleSeconds")
+        startCycleTimer()
+        render()
+    }
+
+    private func startCycleTimer() {
+        cycleTimer?.invalidate()
+        cycleTimer = Timer.scheduledTimer(timeInterval: TimeInterval(cycleSeconds), target: self, selector: #selector(advanceProvider), userInfo: nil, repeats: true)
+    }
+
+    @objc private func advanceProvider() {
+        if providerMode == .alternating {
+            currentProvider = currentProvider == .codex ? .claude : .codex
+        }
+        render()
+    }
 
     @objc private func enableClaude() {
         do {
@@ -228,11 +329,24 @@ private final class QuotaController: NSObject {
         let claude = ClaudeBridge.read()
         let now = Date().timeIntervalSince1970
         let label = displayMode == .available ? "disponible" : "utilisé"
-        let options = menu.item(withTitle: "Afficher")?.submenu
-        options?.item(withTitle: "Pourcentage disponible")?.state = displayMode == .available ? .on : .off
-        options?.item(withTitle: "Pourcentage utilisé")?.state = displayMode == .used ? .on : .off
-        for provider in Provider.allCases {
-            guard let button = statusItems[provider]?.button else { continue }
+
+        menu.item(withTitle: "Afficher")?.submenu?.item(withTitle: "Pourcentage disponible")?.state = displayMode == .available ? .on : .off
+        menu.item(withTitle: "Afficher")?.submenu?.item(withTitle: "Pourcentage utilisé")?.state = displayMode == .used ? .on : .off
+        let providerMenu = menu.item(withTitle: "Services affichés")?.submenu
+        providerMenu?.item(withTitle: "Défilement automatique")?.state = providerMode == .alternating ? .on : .off
+        providerMenu?.item(withTitle: "ChatGPT et Claude côte à côte")?.state = providerMode == .both ? .on : .off
+        providerMenu?.item(withTitle: "ChatGPT seulement")?.state = providerMode == .codex ? .on : .off
+        providerMenu?.item(withTitle: "Claude seulement")?.state = providerMode == .claude ? .on : .off
+        let windowMenu = menu.item(withTitle: "Quotas affichés")?.submenu
+        windowMenu?.item(withTitle: "5 h et 7 j")?.state = windowMode == .both ? .on : .off
+        windowMenu?.item(withTitle: "5 h seulement")?.state = windowMode == .session ? .on : .off
+        windowMenu?.item(withTitle: "7 j seulement")?.state = windowMode == .weekly ? .on : .off
+        let speedMenu = menu.item(withTitle: "Vitesse du défilement")?.submenu
+        speedMenu?.item(withTitle: "Toutes les 5 secondes")?.state = cycleSeconds == 5 ? .on : .off
+        speedMenu?.item(withTitle: "Toutes les 10 secondes")?.state = cycleSeconds == 10 ? .on : .off
+        speedMenu?.item(withTitle: "Toutes les 20 secondes")?.state = cycleSeconds == 20 ? .on : .off
+
+        func texts(for provider: Provider) -> (String, String) {
             let sessionUsed = provider == .codex ? codexSession?.usedPercent : claude?.sessionUsed
             let weeklyUsed = provider == .codex ? codexWeek?.usedPercent : claude?.weeklyUsed
             let sessionReset = provider == .codex ? codexSession?.resetsAt : claude?.sessionReset
@@ -242,9 +356,37 @@ private final class QuotaController: NSObject {
             let weeklyValid = fresh && (weeklyReset.map { $0 > now } ?? true)
             let sessionText = sessionValid ? sessionUsed.map(number) ?? "—" : "—"
             let weeklyText = weeklyValid ? weeklyUsed.map(number) ?? "—" : "—"
-            button.title = "5h \(sessionText) · 7j \(weeklyText)"
+            let title: String
+            switch windowMode {
+            case .both: title = "5h \(sessionText) · 7j \(weeklyText)"
+            case .session: title = "5h \(sessionText)"
+            case .weekly: title = "7j \(weeklyText)"
+            }
             let name = provider == .codex ? "ChatGPT / Codex" : "Claude"
-            button.toolTip = "\(name) : 5h \(sessionText), 7j \(weeklyText) \(label)"
+            return (title, "\(name) : 5h \(sessionText), 7j \(weeklyText) \(label)")
+        }
+
+        func show(_ provider: Provider, on statusItem: NSStatusItem) {
+            let content = texts(for: provider)
+            statusItem.button?.image = provider == .codex ? codexIcon : claudeIcon
+            statusItem.button?.title = content.0
+            statusItem.button?.toolTip = content.1
+        }
+
+        switch providerMode {
+        case .alternating:
+            show(currentProvider, on: primaryStatusItem)
+            secondaryStatusItem.isVisible = false
+        case .both:
+            show(.codex, on: primaryStatusItem)
+            show(.claude, on: secondaryStatusItem)
+            secondaryStatusItem.isVisible = true
+        case .codex:
+            show(.codex, on: primaryStatusItem)
+            secondaryStatusItem.isVisible = false
+        case .claude:
+            show(.claude, on: primaryStatusItem)
+            secondaryStatusItem.isVisible = false
         }
         if let session = codexSession {
             codexItem.title = "Codex · 5h \(number(session.usedPercent)) · 7j \(codexWeek.map { number($0.usedPercent) } ?? "—") \(label)"
