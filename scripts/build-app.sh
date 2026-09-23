@@ -3,17 +3,16 @@ set -euo pipefail
 
 script_dir="${0:A:h}"
 project_dir="${script_dir:h}"
-app_dir="${project_dir}/Codex Quota.app"
-icon_source="${project_dir}/Assets/codex-quota-icon.png"
-iconset_dir="${project_dir}/.build/CodexQuota.iconset"
-icon_file="${app_dir}/Contents/Resources/CodexQuota.icns"
+app_dir="${project_dir}/AI Quota.app"
+icon_source="${project_dir}/Assets/ai-quota-icon.png"
+iconset_dir="${project_dir}/.build/AIQuota.iconset"
+icon_file="${app_dir}/Contents/Resources/AIQuota.icns"
 
 cd "$project_dir"
 swift build -c release
 
-rm -rf "$app_dir"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
-cp ".build/release/CodexQuotaWidget" "$app_dir/Contents/MacOS/CodexQuotaWidget"
+cp ".build/release/AIQuota" "$app_dir/Contents/MacOS/AIQuota"
 
 if [[ -f "$icon_source" ]]; then
   rm -rf "$iconset_dir"
@@ -35,10 +34,11 @@ cat > "$app_dir/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleExecutable</key><string>CodexQuotaWidget</string>
-  <key>CFBundleIdentifier</key><string>com.local.codex-quota-widget</string>
-  <key>CFBundleIconFile</key><string>CodexQuota</string>
-  <key>CFBundleName</key><string>Codex Quota</string>
+  <key>CFBundleExecutable</key><string>AIQuota</string>
+  <key>CFBundleIdentifier</key><string>com.local.ai-quota</string>
+  <key>CFBundleIconFile</key><string>AIQuota</string>
+  <key>CFBundleName</key><string>AI Quota</string>
+  <key>CFBundleDisplayName</key><string>AI Quota</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSUIElement</key><true/>

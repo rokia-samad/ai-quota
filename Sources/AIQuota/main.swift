@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import ServiceManagement
+import UserNotifications
 
 private struct UsageWindow: Decodable, Sendable {
     let usedPercent: Double
@@ -58,7 +60,7 @@ private struct ClaudeReading {
 private enum ClaudeBridge {
     static var cacheURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CodexQuotaWidget/claude-usage.json")
+            .appendingPathComponent("Library/Application Support/AIQuota/claude-usage.json")
     }
 
     static func captureStatusLine() {
@@ -110,7 +112,18 @@ private enum ClaudeBridge {
         }()
 
         if let statusLine, let desktop {
-            return statusLine.capturedAt >= desktop.capturedAt ? statusLine : desktop
+            if statusLine.capturedAt >= desktop.capturedAt { return statusLine }
+            let statusLineIsRecent = Date().timeIntervalSince1970 - statusLine.capturedAt <= statusLine.maxAge
+            guard statusLineIsRecent else { return desktop }
+            return ClaudeReading(
+                sessionUsed: desktop.sessionUsed,
+                weeklyUsed: desktop.weeklyUsed,
+                sessionReset: statusLine.sessionReset,
+                weeklyReset: statusLine.weeklyReset,
+                capturedAt: desktop.capturedAt,
+                source: "Claude Desktop + Claude Code",
+                maxAge: desktop.maxAge
+            )
         }
         return statusLine ?? desktop
     }
@@ -126,15 +139,16 @@ private enum ClaudeBridge {
         }
         let executable = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
         let quoted = "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        settings["statusLine"] = ["type": "command", "command": "\(quoted) --claude-statusline"]
+        settings["statusLine"] = ["type": "command", "command": "\(quoted) --claude-statusline", "refreshInterval": 60]
         let updated = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
         try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try updated.write(to: settingsURL, options: .atomic)
     }
+
 }
 
 @MainActor
-private final class QuotaController: NSObject {
+private final class QuotaController: NSObject, NSMenuDelegate {
     private enum DisplayMode: String { case available, used }
     private enum Provider { case codex, claude }
     private enum ProviderMode: String { case alternating, both, codex, claude }
@@ -143,13 +157,24 @@ private final class QuotaController: NSObject {
     private let menu = NSMenu()
     private let primaryStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let secondaryStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let codexItem = NSMenuItem(title: "Codex : connexion…", action: nil, keyEquivalent: "")
+    private let codexItem = NSMenuItem(title: "ChatGPT : connexion…", action: nil, keyEquivalent: "")
     private let claudeItem = NSMenuItem(title: "Claude : en attente d’une session", action: nil, keyEquivalent: "")
+    private let codexAgeItem = NSMenuItem(title: "ChatGPT : aucune mesure", action: nil, keyEquivalent: "")
+    private let claudeAgeItem = NSMenuItem(title: "Claude : aucune mesure", action: nil, keyEquivalent: "")
+    private let chatgptSessionResetItem = NSMenuItem(title: "ChatGPT 5 h : en attente", action: nil, keyEquivalent: "")
+    private let chatgptWeeklyResetItem = NSMenuItem(title: "ChatGPT 7 j : en attente", action: nil, keyEquivalent: "")
+    private let claudeSessionResetItem = NSMenuItem(title: "Claude 5 h : en attente", action: nil, keyEquivalent: "")
+    private let claudeWeeklyResetItem = NSMenuItem(title: "Claude 7 j : en attente", action: nil, keyEquivalent: "")
+    private let alertThresholdItem = NSMenuItem(title: "Seuil actuel : désactivé", action: nil, keyEquivalent: "")
     private let countdownItem = NSMenuItem(title: "Prochain changement : 10 s", action: nil, keyEquivalent: "")
     private let client = CodexAppServerClient()
     private var refreshTimer: Timer?
     private var cycleTimer: Timer?
     private var codexLimits: RateLimitResponse?
+    private var codexCapturedAt: TimeInterval?
+    private var alertThreshold = UserDefaults.standard.integer(forKey: "quotaAlertThreshold")
+    private var alertsAuthorized = false
+    private var alertedWindows = Set<String>()
     private var displayMode: DisplayMode = UserDefaults.standard.string(forKey: "quotaDisplayMode") == "used" ? .used : .available
     private var providerMode = ProviderMode(rawValue: UserDefaults.standard.string(forKey: "quotaProviderMode") ?? "") ?? .alternating
     private var windowMode = WindowMode(rawValue: UserDefaults.standard.string(forKey: "quotaWindowMode") ?? "") ?? .both
@@ -196,8 +221,16 @@ private final class QuotaController: NSObject {
     }
 
     func start() {
+        menu.delegate = self
         menu.addItem(codexItem)
+        menu.addItem(chatgptSessionResetItem)
+        menu.addItem(chatgptWeeklyResetItem)
+        menu.addItem(codexAgeItem)
+        menu.addItem(.separator())
         menu.addItem(claudeItem)
+        menu.addItem(claudeSessionResetItem)
+        menu.addItem(claudeWeeklyResetItem)
+        menu.addItem(claudeAgeItem)
         menu.addItem(.separator())
         let displayMenu = NSMenu()
         for (title, selector) in [("Pourcentage disponible", #selector(showAvailable)), ("Pourcentage utilisé", #selector(showUsed))] {
@@ -262,15 +295,33 @@ private final class QuotaController: NSObject {
         }
         menu.setSubmenu(refreshMenu, for: menu.addItem(withTitle: "Actualisation automatique", action: nil, keyEquivalent: ""))
 
+        menu.addItem(withTitle: "Lancer à l’ouverture de session", action: #selector(toggleLaunchAtLogin), keyEquivalent: "").target = self
+        let alertsMenu = NSMenu()
+        alertsMenu.addItem(alertThresholdItem)
+        alertsMenu.addItem(.separator())
+        for (title, selector) in [
+            ("Désactivées", #selector(disableAlerts)),
+            ("Sous 10 % disponibles", #selector(alertBelow10)),
+            ("Sous 20 % disponibles", #selector(alertBelow20)),
+            ("Sous 30 % disponibles", #selector(alertBelow30))
+        ] {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            alertsMenu.addItem(item)
+        }
+        alertsMenu.addItem(withTitle: "Seuil personnalisé…", action: #selector(customizeAlertThreshold), keyEquivalent: "").target = self
+        menu.setSubmenu(alertsMenu, for: menu.addItem(withTitle: "Alertes de quota", action: nil, keyEquivalent: ""))
+
         menu.addItem(withTitle: "Relier Claude Code (terminal)", action: #selector(enableClaude), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Actualiser", action: #selector(refresh), keyEquivalent: "r").target = self
-        menu.addItem(withTitle: "Quitter Quota Widget", action: #selector(quit), keyEquivalent: "q").target = self
+        menu.addItem(withTitle: "Quitter AI Quota", action: #selector(quit), keyEquivalent: "q").target = self
 
         primaryStatusItem.menu = menu
         secondaryStatusItem.menu = menu
         primaryStatusItem.button?.imagePosition = .imageLeading
         secondaryStatusItem.button?.imagePosition = .imageLeading
         render()
+        if alertThreshold > 0 { requestAlertAuthorization() }
         Task { [weak self] in
             guard let self else { return }
             await client.setRateLimitsChangedHandler { [weak self] data in
@@ -285,6 +336,72 @@ private final class QuotaController: NSObject {
     @objc private func refresh() {
         render()
         Task { await refreshAsync() }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) { render() }
+
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            let service = SMAppService.mainApp
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+            render()
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.messageText = "Impossible de modifier le lancement automatique"
+            alert.runModal()
+        }
+    }
+
+    @objc private func disableAlerts() { setAlertThreshold(0) }
+    @objc private func alertBelow10() { setAlertThreshold(10) }
+    @objc private func alertBelow20() { setAlertThreshold(20) }
+    @objc private func alertBelow30() { setAlertThreshold(30) }
+
+    @objc private func customizeAlertThreshold() {
+        let alert = NSAlert()
+        alert.messageText = "Seuil d’alerte personnalisé"
+        alert.informativeText = "Choisis un pourcentage disponible entre 1 et 99. Une alerte sera envoyée en dessous de ce seuil."
+        alert.addButton(withTitle: "Enregistrer")
+        alert.addButton(withTitle: "Annuler")
+        let field = NSTextField(string: String(alertThreshold > 0 ? alertThreshold : 10))
+        field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
+        alert.accessoryView = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let threshold = Int(value), (1...99).contains(threshold) else {
+            let error = NSAlert()
+            error.messageText = "Seuil invalide"
+            error.informativeText = "Saisis un nombre entier entre 1 et 99 %."
+            error.runModal()
+            return
+        }
+        setAlertThreshold(threshold)
+    }
+
+    private func setAlertThreshold(_ threshold: Int) {
+        alertThreshold = threshold
+        alertedWindows.removeAll()
+        alertsAuthorized = false
+        UserDefaults.standard.set(threshold, forKey: "quotaAlertThreshold")
+        if threshold > 0 { requestAlertAuthorization() }
+        render()
+    }
+
+    private func requestAlertAuthorization() {
+        Task {
+            do {
+                alertsAuthorized = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                render()
+            } catch {
+                let alert = NSAlert(error: error)
+                alert.runModal()
+            }
+        }
     }
     @objc private func showAvailable() { displayMode = .available; saveDisplayMode() }
     @objc private func showUsed() { displayMode = .used; saveDisplayMode() }
@@ -419,11 +536,15 @@ private final class QuotaController: NSObject {
 
     private func refreshAsync() async {
         do { updateCodex(try await client.readRateLimits()) }
-        catch { codexItem.title = "Codex : \(error.localizedDescription)"; render() }
+        catch { codexItem.title = "ChatGPT : \(error.localizedDescription)"; render() }
         render()
     }
 
-    private func updateCodex(_ data: RateLimitResponse) { codexLimits = data; render() }
+    private func updateCodex(_ data: RateLimitResponse) {
+        codexLimits = data
+        codexCapturedAt = Date().timeIntervalSince1970
+        render()
+    }
 
     private func render() {
         let codexSession = codexLimits?.rateLimits.primary
@@ -454,13 +575,39 @@ private final class QuotaController: NSObject {
         refreshMenu?.item(withTitle: "Toutes les 30 secondes")?.state = refreshSeconds == 30 ? .on : .off
         refreshMenu?.item(withTitle: "Toutes les 1 minute")?.state = refreshSeconds == 60 ? .on : .off
         refreshMenu?.item(withTitle: "Toutes les 5 minutes")?.state = refreshSeconds == 300 ? .on : .off
+        menu.item(withTitle: "Lancer à l’ouverture de session")?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        let alertsMenu = menu.item(withTitle: "Alertes de quota")?.submenu
+        alertsMenu?.item(withTitle: "Désactivées")?.state = alertThreshold == 0 ? .on : .off
+        alertsMenu?.item(withTitle: "Sous 10 % disponibles")?.state = alertThreshold == 10 ? .on : .off
+        alertsMenu?.item(withTitle: "Sous 20 % disponibles")?.state = alertThreshold == 20 ? .on : .off
+        alertsMenu?.item(withTitle: "Sous 30 % disponibles")?.state = alertThreshold == 30 ? .on : .off
+        alertsMenu?.item(withTitle: "Seuil personnalisé…")?.state = alertThreshold > 0 && ![10, 20, 30].contains(alertThreshold) ? .on : .off
+        alertThresholdItem.title = alertThreshold > 0 ? "Seuil actuel : \(alertThreshold) % disponibles" : "Seuil actuel : désactivé"
 
-        func texts(for provider: Provider) -> (String, String) {
+        let codexFresh = codexCapturedAt.map { now - $0 <= max(300, TimeInterval(refreshSeconds * 2)) } ?? false
+        let claudeFresh = claude.map { now - $0.capturedAt <= $0.maxAge } ?? false
+        codexAgeItem.title = "ChatGPT · dernière mesure : \(ageText(codexCapturedAt, now: now))\(codexFresh ? "" : " · ancienne")"
+        claudeAgeItem.title = "Claude · dernière mesure : \(ageText(claude?.capturedAt, now: now))\(claudeFresh ? "" : " · ancienne")"
+        chatgptSessionResetItem.title = "ChatGPT 5 h · \(resetText(codexSession?.resetsAt, fresh: codexFresh))"
+        chatgptWeeklyResetItem.title = "ChatGPT 7 j · \(resetText(codexWeek?.resetsAt, fresh: codexFresh))"
+        let claudeFallback = claude?.source == "Claude Desktop" ? "non fourni par Claude Desktop" : "indisponible"
+        claudeSessionResetItem.title = "Claude 5 h · \(resetText(claude?.sessionReset, fresh: claudeFresh, fallback: claudeFallback))"
+        claudeWeeklyResetItem.title = "Claude 7 j · \(resetText(claude?.weeklyReset, fresh: claudeFresh, fallback: claudeFallback))"
+        if codexFresh {
+            if let value = codexSession?.usedPercent { checkAlert(provider: .codex, window: "5h", used: value) }
+            if let value = codexWeek?.usedPercent { checkAlert(provider: .codex, window: "7j", used: value) }
+        }
+        if claudeFresh {
+            if let value = claude?.sessionUsed { checkAlert(provider: .claude, window: "5h", used: value) }
+            if let value = claude?.weeklyUsed { checkAlert(provider: .claude, window: "7j", used: value) }
+        }
+
+        func texts(for provider: Provider) -> (String, String, [NSRange]) {
             let sessionUsed = provider == .codex ? codexSession?.usedPercent : claude?.sessionUsed
             let weeklyUsed = provider == .codex ? codexWeek?.usedPercent : claude?.weeklyUsed
             let sessionReset = provider == .codex ? codexSession?.resetsAt : claude?.sessionReset
             let weeklyReset = provider == .codex ? codexWeek?.resetsAt : claude?.weeklyReset
-            let fresh = provider == .codex || (claude.map { now - $0.capturedAt <= $0.maxAge } ?? false)
+            let fresh = provider == .codex ? codexFresh : claudeFresh
             let sessionValid = fresh && (sessionReset.map { $0 > now } ?? true)
             let weeklyValid = fresh && (weeklyReset.map { $0 > now } ?? true)
             let sessionText = sessionValid ? sessionUsed.map(number) ?? "—" : "—"
@@ -471,14 +618,28 @@ private final class QuotaController: NSObject {
             case .session: title = "5h \(sessionText)"
             case .weekly: title = "7j \(weeklyText)"
             }
-            let name = provider == .codex ? "ChatGPT / Codex" : "Claude"
-            return (title, "\(name) : 5h \(sessionText), 7j \(weeklyText) \(label)")
+            let name = provider == .codex ? "ChatGPT" : "Claude"
+            let capturedAt = provider == .codex ? codexCapturedAt : claude?.capturedAt
+            var redRanges: [NSRange] = []
+            for (prefix, text, used, visible) in [
+                ("5h ", sessionText, sessionUsed, windowMode != .weekly && sessionValid),
+                ("7j ", weeklyText, weeklyUsed, windowMode != .session && weeklyValid)
+            ] where visible && (used.map { 100 - $0 < 10 } ?? false) {
+                let full = title as NSString
+                let range = full.range(of: prefix + text)
+                if range.location != NSNotFound {
+                    redRanges.append(NSRange(location: range.location + (prefix as NSString).length, length: (text as NSString).length))
+                }
+            }
+            return (title, "\(name) : 5h \(sessionText), 7j \(weeklyText) \(label) · mesure \(ageText(capturedAt, now: now))", redRanges)
         }
 
         func show(_ provider: Provider, on statusItem: NSStatusItem) {
             let content = texts(for: provider)
             statusItem.button?.image = provider == .codex ? codexIcon : claudeIcon
-            statusItem.button?.title = content.0
+            let title = NSMutableAttributedString(string: content.0)
+            for range in content.2 { title.addAttribute(.foregroundColor, value: NSColor.systemRed, range: range) }
+            statusItem.button?.attributedTitle = title
             statusItem.button?.toolTip = content.1
         }
 
@@ -486,7 +647,9 @@ private final class QuotaController: NSObject {
         case .alternating:
             show(currentProvider, on: primaryStatusItem)
             if showCountdown, let button = primaryStatusItem.button {
-                button.title += " · \(remainingCycleSeconds)s"
+                let title = NSMutableAttributedString(attributedString: button.attributedTitle)
+                title.append(NSAttributedString(string: " · \(remainingCycleSeconds)s"))
+                button.attributedTitle = title
             }
             secondaryStatusItem.isVisible = false
         case .both:
@@ -501,7 +664,7 @@ private final class QuotaController: NSObject {
             secondaryStatusItem.isVisible = false
         }
         if let session = codexSession {
-            codexItem.title = "Codex · 5h \(number(session.usedPercent)) · 7j \(codexWeek.map { number($0.usedPercent) } ?? "—") \(label)"
+            codexItem.title = "ChatGPT · 5h \(codexFresh ? number(session.usedPercent) : "—") · 7j \(codexFresh ? (codexWeek.map { number($0.usedPercent) } ?? "—") : "—") \(label)"
         }
         if let claude {
             let stale = now - claude.capturedAt > claude.maxAge
@@ -511,11 +674,52 @@ private final class QuotaController: NSObject {
     }
 
     private func number(_ used: Double) -> String {
-        "\(Int((displayMode == .available ? max(0, 100 - used) : used).rounded()))%"
+        let value = displayMode == .available ? max(0, 100 - used).rounded(.down) : used.rounded()
+        return "\(Int(value))%"
     }
 
     private func formatted(_ timestamp: TimeInterval) -> String {
         Date(timeIntervalSince1970: timestamp).formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private func resetText(_ timestamp: TimeInterval?, fresh: Bool, fallback: String = "indisponible") -> String {
+        guard let timestamp else { return fallback }
+        guard fresh else { return "mesure ancienne, date non fiable" }
+        guard timestamp > Date().timeIntervalSince1970 else { return "en attente d’un nouveau relevé" }
+        let date = Date(timeIntervalSince1970: timestamp)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "fr_FR")
+        formatter.timeZone = .current
+        formatter.dateStyle = .full
+        formatter.timeStyle = .short
+        let zone = formatter.timeZone.abbreviation(for: date) ?? ""
+        return "reset le \(formatter.string(from: date)) \(zone)"
+    }
+
+    private func ageText(_ timestamp: TimeInterval?, now: TimeInterval) -> String {
+        guard let timestamp else { return "aucune" }
+        let seconds = max(0, Int(now - timestamp))
+        if seconds < 60 { return "à l’instant" }
+        if seconds < 3_600 { return "il y a \(seconds / 60) min" }
+        return "il y a \(seconds / 3_600) h \((seconds % 3_600) / 60) min"
+    }
+
+    private func checkAlert(provider: Provider, window: String, used: Double) {
+        guard alertThreshold > 0 else { return }
+        let key = "\(provider)-\(window)"
+        let available = max(0, 100 - used)
+        if available >= Double(alertThreshold) {
+            alertedWindows.remove(key)
+            return
+        }
+        guard alertsAuthorized, alertedWindows.insert(key).inserted else { return }
+        let name = provider == .codex ? "ChatGPT" : "Claude"
+        let content = UNMutableNotificationContent()
+        content.title = "Quota \(name) faible"
+        content.body = "\(window) : \(Int(available.rounded(.down))) % disponibles (seuil : \(alertThreshold) %)."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "quota-\(key)", content: content, trigger: nil)
+        Task { try? await UNUserNotificationCenter.current().add(request) }
     }
 
     @objc private func quit() { NSApplication.shared.terminate(nil) }
@@ -541,7 +745,7 @@ private actor CodexAppServerClient {
         if process?.isRunning == true { return }
         let candidates = ["/Applications/ChatGPT.app/Contents/Resources/codex", "/usr/local/bin/codex", "/opt/homebrew/bin/codex"]
         guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw NSError(domain: "QuotaWidget", code: 1, userInfo: [NSLocalizedDescriptionKey: "Exécutable Codex introuvable."])
+            throw NSError(domain: "AIQuota", code: 1, userInfo: [NSLocalizedDescriptionKey: "Composant ChatGPT introuvable."])
         }
         let task = Process()
         task.executableURL = URL(fileURLWithPath: executable)
@@ -558,7 +762,7 @@ private actor CodexAppServerClient {
             guard !chunk.isEmpty else { return }
             Task { await self?.consume(chunk) }
         }
-        _ = try await request(method: "initialize", params: ["clientInfo": ["name": "quota_widget", "title": "Quota Widget", "version": "2.0"]])
+        _ = try await request(method: "initialize", params: ["clientInfo": ["name": "ai_quota", "title": "AI Quota", "version": "2.0"]])
         send(["method": "initialized", "params": [:]])
     }
 
@@ -570,7 +774,7 @@ private actor CodexAppServerClient {
             guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
             if let id = object["id"] as? Int, let continuation = continuations.removeValue(forKey: id) {
                 if let result = object["result"], let data = try? JSONSerialization.data(withJSONObject: result) { continuation.resume(returning: data) }
-                else { continuation.resume(throwing: NSError(domain: "QuotaWidget", code: 2, userInfo: [NSLocalizedDescriptionKey: "Réponse Codex invalide."])) }
+                else { continuation.resume(throwing: NSError(domain: "AIQuota", code: 2, userInfo: [NSLocalizedDescriptionKey: "Réponse ChatGPT invalide."])) }
             } else if object["method"] as? String == "account/rateLimits/updated",
                       let params = object["params"], let data = try? JSONSerialization.data(withJSONObject: params),
                       let limits = try? JSONDecoder().decode(RateLimitResponse.self, from: data) { onRateLimitsChanged?(limits) }
@@ -605,6 +809,21 @@ if CommandLine.arguments.contains("--claude-statusline") {
         try ClaudeBridge.installStatusLine()
         print("Ligne de statut Claude Code activée.")
     } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+} else if CommandLine.arguments.contains("--login-status") {
+    print(SMAppService.mainApp.status == .enabled ? "enabled" : "disabled")
+    exit(SMAppService.mainApp.status == .enabled ? EXIT_SUCCESS : EXIT_FAILURE)
+} else if CommandLine.arguments.contains("--unregister-login") {
+    do { try SMAppService.mainApp.unregister() }
+    catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+} else if CommandLine.arguments.contains("--register-login") {
+    do { try SMAppService.mainApp.register() }
+    catch {
         FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
         exit(EXIT_FAILURE)
     }

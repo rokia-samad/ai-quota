@@ -2,8 +2,8 @@
 import PackageDescription
 
 let package = Package(
-    name: "CodexQuotaWidget",
+    name: "AIQuota",
     platforms: [.macOS(.v14)],
-    products: [.executable(name: "CodexQuotaWidget", targets: ["CodexQuotaWidget"])],
-    targets: [.executableTarget(name: "CodexQuotaWidget")]
+    products: [.executable(name: "AIQuota", targets: ["AIQuota"])],
+    targets: [.executableTarget(name: "AIQuota")]
 )
