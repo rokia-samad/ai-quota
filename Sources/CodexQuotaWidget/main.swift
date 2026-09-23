@@ -31,6 +31,30 @@ private struct ClaudeSample: Codable {
     let captured_at: TimeInterval
 }
 
+private struct ClaudeHistory: Decodable {
+    struct Usage: Decodable {
+        let fh: Double?
+        let sd: Double?
+    }
+
+    struct Sample: Decodable {
+        let t: TimeInterval
+        let u: Usage
+    }
+
+    let samples: [Sample]
+}
+
+private struct ClaudeReading {
+    let sessionUsed: Double?
+    let weeklyUsed: Double?
+    let sessionReset: TimeInterval?
+    let weeklyReset: TimeInterval?
+    let capturedAt: TimeInterval
+    let source: String
+    let maxAge: TimeInterval
+}
+
 private enum ClaudeBridge {
     static var cacheURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -53,9 +77,42 @@ private enum ClaudeBridge {
         print("Claude Code")
     }
 
-    static func read() -> ClaudeSample? {
-        guard let data = try? Data(contentsOf: cacheURL) else { return nil }
-        return try? JSONDecoder().decode(ClaudeSample.self, from: data)
+    static func read() -> ClaudeReading? {
+        let statusLine: ClaudeReading? = {
+            guard let data = try? Data(contentsOf: cacheURL),
+                  let sample = try? JSONDecoder().decode(ClaudeSample.self, from: data) else { return nil }
+            return ClaudeReading(
+                sessionUsed: sample.rate_limits.five_hour?.used_percentage,
+                weeklyUsed: sample.rate_limits.seven_day?.used_percentage,
+                sessionReset: sample.rate_limits.five_hour?.resets_at,
+                weeklyReset: sample.rate_limits.seven_day?.resets_at,
+                capturedAt: sample.captured_at,
+                source: "Claude Code",
+                maxAge: 900
+            )
+        }()
+
+        let desktop: ClaudeReading? = {
+            let path = "Library/Application Support/Claude/plan-usage-history.json"
+            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(path)
+            guard let data = try? Data(contentsOf: url),
+                  let history = try? JSONDecoder().decode(ClaudeHistory.self, from: data),
+                  let sample = history.samples.max(by: { $0.t < $1.t }) else { return nil }
+            return ClaudeReading(
+                sessionUsed: sample.u.fh,
+                weeklyUsed: sample.u.sd,
+                sessionReset: nil,
+                weeklyReset: nil,
+                capturedAt: sample.t / 1_000,
+                source: "Claude Desktop",
+                maxAge: 1_800
+            )
+        }()
+
+        if let statusLine, let desktop {
+            return statusLine.capturedAt >= desktop.capturedAt ? statusLine : desktop
+        }
+        return statusLine ?? desktop
     }
 
     static func installStatusLine() throws {
@@ -80,10 +137,9 @@ private enum ClaudeBridge {
 private final class QuotaController: NSObject {
     private enum DisplayMode: String { case available, used }
     private enum Provider: CaseIterable { case codex, claude }
-    private enum Window: CaseIterable { case session, weekly }
 
     private let menu = NSMenu()
-    private var statusItems: [String: NSStatusItem] = [:]
+    private var statusItems: [Provider: NSStatusItem] = [:]
     private let codexItem = NSMenuItem(title: "Codex : connexion…", action: nil, keyEquivalent: "")
     private let claudeItem = NSMenuItem(title: "Claude : en attente d’une session", action: nil, keyEquivalent: "")
     private let client = CodexAppServerClient()
@@ -92,18 +148,22 @@ private final class QuotaController: NSObject {
     private var displayMode: DisplayMode = UserDefaults.standard.string(forKey: "quotaDisplayMode") == "used" ? .used : .available
 
     private func providerIcon(_ provider: Provider) -> NSImage? {
-        let image: NSImage?
-        if provider == .codex {
-            let iconPath = Bundle.main.resourceURL?.appendingPathComponent("CodexQuota.icns").path
-            if let iconPath, FileManager.default.fileExists(atPath: iconPath) {
-                image = NSImage(contentsOfFile: iconPath)
-            } else {
-                image = NSWorkspace.shared.icon(forFile: "/Applications/ChatGPT.app")
-            }
-        } else {
-            image = NSWorkspace.shared.icon(forFile: "/Applications/Claude.app")
-        }
-        image?.size = NSSize(width: 16, height: 16)
+        let path = provider == .codex
+            ? "/Applications/ChatGPT.app/Contents/Resources/chatgptTemplate@2x.png"
+            : "/Applications/Claude.app/Contents/Resources/TrayIconTemplate@2x.png"
+        guard let source = NSImage(contentsOfFile: path) else { return nil }
+        let size = NSSize(width: 16, height: 16)
+        let bounds = NSRect(origin: .zero, size: size)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        source.draw(in: bounds)
+        let color = provider == .codex
+            ? NSColor(red: 0.16, green: 0.52, blue: 0.96, alpha: 1)
+            : NSColor(red: 0.86, green: 0.43, blue: 0.28, alpha: 1)
+        color.setFill()
+        bounds.fill(using: .sourceIn)
+        image.unlockFocus()
+        image.isTemplate = false
         return image
     }
 
@@ -118,19 +178,16 @@ private final class QuotaController: NSObject {
             displayMenu.addItem(item)
         }
         menu.setSubmenu(displayMenu, for: menu.addItem(withTitle: "Afficher", action: nil, keyEquivalent: ""))
-        menu.addItem(withTitle: "Activer les quotas Claude Code", action: #selector(enableClaude), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Relier Claude Code (terminal)", action: #selector(enableClaude), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Actualiser", action: #selector(refresh), keyEquivalent: "r").target = self
         menu.addItem(withTitle: "Quitter Quota Widget", action: #selector(quit), keyEquivalent: "q").target = self
 
         for provider in Provider.allCases {
-            let icon = providerIcon(provider)
-            for window in Window.allCases {
-                let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-                item.button?.image = icon
-                item.button?.imagePosition = .imageLeading
-                item.menu = menu
-                statusItems[key(provider, window)] = item
-            }
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            item.button?.image = providerIcon(provider)
+            item.button?.imagePosition = .imageLeading
+            item.menu = menu
+            statusItems[provider] = item
         }
         render()
         Task { [weak self] in
@@ -142,8 +199,6 @@ private final class QuotaController: NSObject {
         }
         timer = Timer.scheduledTimer(timeInterval: 60, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
     }
-
-    private func key(_ provider: Provider, _ window: Window) -> String { "\(provider)-\(window)" }
 
     @objc private func refresh() { Task { await refreshAsync() } }
     @objc private func showAvailable() { displayMode = .available; saveDisplayMode() }
@@ -177,33 +232,27 @@ private final class QuotaController: NSObject {
         options?.item(withTitle: "Pourcentage disponible")?.state = displayMode == .available ? .on : .off
         options?.item(withTitle: "Pourcentage utilisé")?.state = displayMode == .used ? .on : .off
         for provider in Provider.allCases {
-            for window in Window.allCases {
-                guard let button = statusItems[key(provider, window)]?.button else { continue }
-                let used: Double?
-                let reset: TimeInterval?
-                switch (provider, window) {
-                case (.codex, .session): used = codexSession?.usedPercent; reset = codexSession?.resetsAt
-                case (.codex, .weekly): used = codexWeek?.usedPercent; reset = codexWeek?.resetsAt
-                case (.claude, .session): used = claude?.rate_limits.five_hour?.used_percentage; reset = claude?.rate_limits.five_hour?.resets_at
-                case (.claude, .weekly): used = claude?.rate_limits.seven_day?.used_percentage; reset = claude?.rate_limits.seven_day?.resets_at
-                }
-                let sampleIsFresh = provider == .codex || (claude.map { now - $0.captured_at <= 900 } ?? false)
-                let valid = sampleIsFresh && (reset.map { $0 > now } ?? false)
-                let value = valid ? used.map { displayMode == .available ? max(0, 100 - $0) : $0 } : nil
-                let text = value.map { "\(Int($0.rounded()))%" } ?? "—"
-                let name = provider == .codex ? "Codex" : "Claude"
-                let period = window == .session ? "5h" : "7j"
-                button.title = "\(period) \(text)"
-                button.toolTip = "\(name) · \(period) : \(text) \(label)" + (reset.map { " · reset \(formatted($0))" } ?? "")
-            }
+            guard let button = statusItems[provider]?.button else { continue }
+            let sessionUsed = provider == .codex ? codexSession?.usedPercent : claude?.sessionUsed
+            let weeklyUsed = provider == .codex ? codexWeek?.usedPercent : claude?.weeklyUsed
+            let sessionReset = provider == .codex ? codexSession?.resetsAt : claude?.sessionReset
+            let weeklyReset = provider == .codex ? codexWeek?.resetsAt : claude?.weeklyReset
+            let fresh = provider == .codex || (claude.map { now - $0.capturedAt <= $0.maxAge } ?? false)
+            let sessionValid = fresh && (sessionReset.map { $0 > now } ?? true)
+            let weeklyValid = fresh && (weeklyReset.map { $0 > now } ?? true)
+            let sessionText = sessionValid ? sessionUsed.map(number) ?? "—" : "—"
+            let weeklyText = weeklyValid ? weeklyUsed.map(number) ?? "—" : "—"
+            button.title = "5h \(sessionText) · 7j \(weeklyText)"
+            let name = provider == .codex ? "ChatGPT / Codex" : "Claude"
+            button.toolTip = "\(name) : 5h \(sessionText), 7j \(weeklyText) \(label)"
         }
         if let session = codexSession {
             codexItem.title = "Codex · 5h \(number(session.usedPercent)) · 7j \(codexWeek.map { number($0.usedPercent) } ?? "—") \(label)"
         }
         if let claude {
-            let stale = now - claude.captured_at > 900
-            let prefix = stale ? "Claude · dernière mesure" : "Claude"
-            claudeItem.title = "\(prefix) · 5h \(claude.rate_limits.five_hour.map { number($0.used_percentage) } ?? "—") · 7j \(claude.rate_limits.seven_day.map { number($0.used_percentage) } ?? "—") · \(formatted(claude.captured_at))"
+            let stale = now - claude.capturedAt > claude.maxAge
+            let prefix = stale ? "Claude · mesure ancienne" : "Claude"
+            claudeItem.title = "\(prefix) · 5h \(claude.sessionUsed.map(number) ?? "—") · 7j \(claude.weeklyUsed.map(number) ?? "—") · \(claude.source) à \(formatted(claude.capturedAt))"
         }
     }
 
@@ -290,6 +339,13 @@ private actor CodexAppServerClient {
 
 if CommandLine.arguments.contains("--claude-statusline") {
     ClaudeBridge.captureStatusLine()
+} else if CommandLine.arguments.contains("--diagnose-claude") {
+    if let reading = ClaudeBridge.read() {
+        print("\(reading.source) · 5h \(reading.sessionUsed.map { String(Int($0.rounded())) } ?? "—")% · 7j \(reading.weeklyUsed.map { String(Int($0.rounded())) } ?? "—")% · mesure \(Date(timeIntervalSince1970: reading.capturedAt))")
+    } else {
+        print("Aucune mesure Claude disponible.")
+        exit(EXIT_FAILURE)
+    }
 } else if CommandLine.arguments.contains("--install-claude-statusline") {
     do {
         try ClaudeBridge.installStatusLine()
