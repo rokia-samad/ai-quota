@@ -1,6 +1,6 @@
 # Codex + Claude Quota Widget
 
-Une petite app macOS de barre de menus qui affiche les quotas Codex et Claude. Elle montre deux blocs : logo ChatGPT bleu avec les quotas 5 h et 7 j, puis logo Claude orange avec les quotas 5 h et 7 j.
+Une petite app macOS de barre de menus qui affiche les quotas Codex et Claude. Par défaut, elle alterne automatiquement entre un badge ChatGPT bleu et un badge Claude orange. Chaque badge montre les quotas 5 h et 7 j.
 
 ## Prérequis
 
@@ -22,11 +22,14 @@ Pour créer une version optimisée :
 ./scripts/build-app.sh
 ```
 
-L’app affiche `logo bleu 5h 84% · 7j 80%` puis `logo orange 5h 84% · 7j 80%` dans la barre de menus. Dans le menu, choisis :
+L’app affiche par exemple `logo bleu 5h 84% · 7j 80%`, puis `logo orange 5h 84% · 7j 80%` dans la barre de menus. Dans le menu, choisis :
 
 - **Afficher** : pourcentage **disponible** ou **utilisé**.
+- **Services affichés** : défilement automatique, les deux côte à côte, ChatGPT seulement ou Claude seulement.
+- **Quotas affichés** : 5 h et 7 j, 5 h seulement ou 7 j seulement.
+- **Vitesse du défilement** : toutes les 5, 10 ou 20 secondes.
 
-Ce choix est mémorisé.
+Ces choix sont mémorisés. Le défilement automatique passe d’un service à l’autre toutes les 10 secondes par défaut.
 
 Pour Claude Desktop, le widget lit automatiquement la dernière mesure locale enregistrée par l’app. Pour Claude Code dans le terminal, le menu « Relier Claude Code (terminal) » configure sa [ligne de statut officielle](https://code.claude.com/docs/en/statusline). Si une ligne de statut personnalisée existe déjà, l'app ne la remplace pas ; intègre alors la commande `CodexQuotaWidget --claude-statusline` à ton script existant en lui transmettant son JSON d'entrée.
 
