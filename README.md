@@ -50,3 +50,17 @@ Le build convertit automatiquement `Assets/ai-quota-icon.png` au format `.icns` 
 ## Notes de confidentialité
 
 L’app ne stocke aucun identifiant ni aucune clé API. Elle lance le service local de ChatGPT (`codex app-server`) et utilise `account/rateLimits/read` ainsi que sa notification de mise à jour. Pour Claude Desktop, elle lit `~/Library/Application Support/Claude/plan-usage-history.json` sans le modifier. Pour Claude Code dans le terminal, elle enregistre uniquement la dernière mesure de quotas dans `~/Library/Application Support/AIQuota/claude-usage.json` ; aucun accès aux identifiants Claude n'est nécessaire.
+
+## Diagnostic Codex et tests
+
+Le tracker lit les quotas **Codex du compte ChatGPT**, pas les limites de tous les modèles de conversation ChatGPT. Il ne contacte aucun endpoint HTTP privé directement : il utilise le protocole local documenté [Codex App Server](https://learn.chatgpt.com/docs/app-server). Le service en amont et l’emplacement du composant embarqué peuvent toutefois évoluer.
+
+La découverte prend en charge le composant actuel de ChatGPT Desktop (`codex-cli/CodexCLI.app/Contents/MacOS/codex`), le composant de Codex Desktop, l’ancien emplacement ChatGPT et les installations CLI Homebrew. Le bucket `codex` de `rateLimitsByLimitId` est prioritaire ; l’ancien champ `rateLimits` reste accepté lorsque la vue multi-bucket est absente. Une catégorie inconnue n’est jamais utilisée à sa place. Seules les fenêtres explicitement identifiées comme 300 ou 10080 minutes sont affichées sous les libellés 5 h / 7 j. Un reset absent ou invalide reste indisponible ; un pourcentage absent ou invalide n’est pas remplacé par zéro.
+
+```sh
+./scripts/test.sh
+swift build -c release
+.build/release/AIQuota --diagnose-codex
+```
+
+Les tests utilisent des fixtures synthétiques et un faux serveur local Python 3 ; ils ne nécessitent aucun compte ni accès réseau. Le diagnostic final, facultatif, lit les quotas du compte connecté sans afficher de credential. Les erreurs RPC, arrêts et délais dépassés sont signalés, les mesures en échec sont retirées de l’affichage, et l’actualisation suivante reconnecte le serveur. Les détails bruts des erreurs du serveur ne sont pas affichés.
