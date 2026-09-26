@@ -530,7 +530,6 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private func refreshAsync() async {
         do { updateCodex(try await client.readRateLimits()) }
         catch { failCodex(error) }
-        render()
     }
 
     private func failCodex(_ error: any Error) {
