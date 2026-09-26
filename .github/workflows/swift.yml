@@ -28,7 +28,7 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            git diff --check "$PR_BASE...$GITHUB_SHA"
+            git diff --check "$PR_BASE" "$GITHUB_SHA"
           elif [[ "$PUSH_BEFORE" == "0000000000000000000000000000000000000000" ]]; then
             git diff-tree --check --root --no-commit-id -r "$GITHUB_SHA"
           else
