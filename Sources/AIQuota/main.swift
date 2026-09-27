@@ -5,119 +5,40 @@ import UserNotifications
 
 import QuotaCore
 
-private struct ClaudeWindow: Codable {
-    let used_percentage: Double
-    let resets_at: TimeInterval
-}
-
-private struct ClaudeLimits: Codable {
-    let five_hour: ClaudeWindow?
-    let seven_day: ClaudeWindow?
-}
-
-private struct ClaudeSample: Codable {
-    let rate_limits: ClaudeLimits
-    let captured_at: TimeInterval
-}
-
-private struct ClaudeHistory: Decodable {
-    struct Usage: Decodable {
-        let fh: Double?
-        let sd: Double?
-    }
-
-    struct Sample: Decodable {
-        let t: TimeInterval
-        let u: Usage
-    }
-
-    let samples: [Sample]
-}
-
-private struct ClaudeReading {
-    let sessionUsed: Double?
-    let weeklyUsed: Double?
-    let sessionReset: TimeInterval?
-    let weeklyReset: TimeInterval?
-    let capturedAt: TimeInterval
-    let source: String
-    let maxAge: TimeInterval
-}
-
 private enum ClaudeBridge {
     static var cacheURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/AIQuota/claude-usage.json")
     }
 
-    static func captureStatusLine() {
-        guard let input = try? FileHandle.standardInput.readToEnd(),
-              let object = try? JSONSerialization.jsonObject(with: input) as? [String: Any] else { return }
-        if let limits = object["rate_limits"] as? [String: Any],
-           let limitsData = try? JSONSerialization.data(withJSONObject: limits),
-           let decoded = try? JSONDecoder().decode(ClaudeLimits.self, from: limitsData),
-           decoded.five_hour != nil || decoded.seven_day != nil {
-            let sample = ClaudeSample(rate_limits: decoded, captured_at: Date().timeIntervalSince1970)
-            if let data = try? JSONEncoder().encode(sample) {
-                try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try? data.write(to: cacheURL, options: .atomic)
-            }
-        }
-        print("Claude Code")
+    static var desktopURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/plan-usage-history.json")
     }
 
-    static func read() -> ClaudeReading? {
-        let statusLine: ClaudeReading? = {
-            guard let data = try? Data(contentsOf: cacheURL),
-                  let sample = try? JSONDecoder().decode(ClaudeSample.self, from: data) else { return nil }
-            return ClaudeReading(
-                sessionUsed: sample.rate_limits.five_hour?.used_percentage,
-                weeklyUsed: sample.rate_limits.seven_day?.used_percentage,
-                sessionReset: sample.rate_limits.five_hour?.resets_at,
-                weeklyReset: sample.rate_limits.seven_day?.resets_at,
-                capturedAt: sample.captured_at,
-                source: "Claude Code",
-                maxAge: 900
-            )
-        }()
-
-        let desktop: ClaudeReading? = {
-            let path = "Library/Application Support/Claude/plan-usage-history.json"
-            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(path)
-            guard let data = try? Data(contentsOf: url),
-                  let history = try? JSONDecoder().decode(ClaudeHistory.self, from: data),
-                  let sample = history.samples.max(by: { $0.t < $1.t }) else { return nil }
-            return ClaudeReading(
-                sessionUsed: sample.u.fh,
-                weeklyUsed: sample.u.sd,
-                sessionReset: nil,
-                weeklyReset: nil,
-                capturedAt: sample.t / 1_000,
-                source: "Claude Desktop",
-                maxAge: 1_800
-            )
-        }()
-
-        if let statusLine, let desktop {
-            if statusLine.capturedAt >= desktop.capturedAt { return statusLine }
-            let statusLineIsRecent = Date().timeIntervalSince1970 - statusLine.capturedAt <= statusLine.maxAge
-            guard statusLineIsRecent else { return desktop }
-            return ClaudeReading(
-                sessionUsed: desktop.sessionUsed,
-                weeklyUsed: desktop.weeklyUsed,
-                sessionReset: statusLine.sessionReset,
-                weeklyReset: statusLine.weeklyReset,
-                capturedAt: desktop.capturedAt,
-                source: "Claude Desktop + Claude Code",
-                maxAge: desktop.maxAge
-            )
+    static func captureStatusLine() {
+        let input = (try? FileHandle.standardInput.readToEnd()) ?? Data()
+        do {
+            print(try ClaudeQuota.captureStatusLine(input: input, cacheURL: cacheURL))
+        } catch {
+            print("AI Quota · cache Claude inaccessible")
+            FileHandle.standardError.write(Data("Cache AI Quota inaccessible\n".utf8))
         }
-        return statusLine ?? desktop
+    }
+
+    static func read() throws -> ClaudeQuotaReading? {
+        try ClaudeQuota.read(desktopURL: desktopURL, statusURL: cacheURL)
     }
 
     static func installStatusLine() throws {
         let settingsURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
-        let data = (try? Data(contentsOf: settingsURL)) ?? Data("{}".utf8)
+        let data: Data
+        if FileManager.default.fileExists(atPath: settingsURL.path) {
+            do { data = try Data(contentsOf: settingsURL) }
+            catch { throw NSError(domain: "ClaudeBridge", code: 3, userInfo: [NSLocalizedDescriptionKey: "Impossible de lire les réglages de Claude Code. Aucun réglage n’a été modifié."]) }
+        } else {
+            data = Data("{}".utf8)
+        }
         guard var settings = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw NSError(domain: "ClaudeBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "Le fichier settings.json de Claude Code n’est pas un objet JSON valide."])
         }
@@ -145,9 +66,9 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private let primaryStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let secondaryStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let codexItem = NSMenuItem(title: "ChatGPT : connexion…", action: nil, keyEquivalent: "")
-    private let claudeItem = NSMenuItem(title: "Claude : en attente d’une session", action: nil, keyEquivalent: "")
+    private let claudeItem = NSMenuItem(title: "Claude · en attente d’une première mesure", action: nil, keyEquivalent: "")
     private let codexAgeItem = NSMenuItem(title: "ChatGPT : aucune mesure", action: nil, keyEquivalent: "")
-    private let claudeAgeItem = NSMenuItem(title: "Claude : aucune mesure", action: nil, keyEquivalent: "")
+    private let claudeAgeItem = NSMenuItem(title: "Claude · en attente d’une première mesure", action: nil, keyEquivalent: "")
     private let chatgptSessionResetItem = NSMenuItem(title: "ChatGPT 5 h : en attente", action: nil, keyEquivalent: "")
     private let chatgptWeeklyResetItem = NSMenuItem(title: "ChatGPT 7 j : en attente", action: nil, keyEquivalent: "")
     private let claudeSessionResetItem = NSMenuItem(title: "Claude 5 h : en attente", action: nil, keyEquivalent: "")
@@ -158,6 +79,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private var refreshTimer: Timer?
     private var cycleTimer: Timer?
     private var codexError: String?
+    private var claudeError: String?
     private var codexLimits: RateLimitResponse?
     private var codexCapturedAt: TimeInterval?
     private var alertThreshold = UserDefaults.standard.integer(forKey: "quotaAlertThreshold")
@@ -221,54 +143,39 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         menu.addItem(claudeAgeItem)
         menu.addItem(.separator())
         let displayMenu = NSMenu()
-        for (title, selector) in [("Pourcentage disponible", #selector(showAvailable)), ("Pourcentage utilisé", #selector(showUsed))] {
+        func addDisplayHeading(_ title: String) {
+            let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            heading.isEnabled = false
+            displayMenu.addItem(heading)
+        }
+        func addDisplayOption(_ title: String, _ selector: Selector) {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
             item.target = self
             displayMenu.addItem(item)
         }
-        menu.setSubmenu(displayMenu, for: menu.addItem(withTitle: "Afficher", action: nil, keyEquivalent: ""))
-
-        let providerMenu = NSMenu()
-        for (title, selector) in [
-            ("Défilement automatique", #selector(showAlternating)),
-            ("ChatGPT et Claude côte à côte", #selector(showBothProviders)),
-            ("ChatGPT seulement", #selector(showCodexOnly)),
-            ("Claude seulement", #selector(showClaudeOnly))
-        ] {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-            item.target = self
-            providerMenu.addItem(item)
-        }
-        menu.setSubmenu(providerMenu, for: menu.addItem(withTitle: "Services affichés", action: nil, keyEquivalent: ""))
-
-        let windowMenu = NSMenu()
-        for (title, selector) in [
-            ("5 h et 7 j", #selector(showBothWindows)),
-            ("5 h seulement", #selector(showSessionOnly)),
-            ("7 j seulement", #selector(showWeeklyOnly))
-        ] {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-            item.target = self
-            windowMenu.addItem(item)
-        }
-        menu.setSubmenu(windowMenu, for: menu.addItem(withTitle: "Quotas affichés", action: nil, keyEquivalent: ""))
-
-        let speedMenu = NSMenu()
-        speedMenu.addItem(countdownItem)
-        speedMenu.addItem(.separator())
-        for (title, selector) in [
-            ("Toutes les 5 secondes", #selector(cycleEvery5)),
-            ("Toutes les 10 secondes", #selector(cycleEvery10)),
-            ("Toutes les 20 secondes", #selector(cycleEvery20))
-        ] {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-            item.target = self
-            speedMenu.addItem(item)
-        }
-        speedMenu.addItem(withTitle: "Durée personnalisée…", action: #selector(customizeCycle), keyEquivalent: "").target = self
-        speedMenu.addItem(.separator())
-        speedMenu.addItem(withTitle: "Afficher le compte à rebours", action: #selector(toggleCountdown), keyEquivalent: "").target = self
-        menu.setSubmenu(speedMenu, for: menu.addItem(withTitle: "Vitesse du défilement", action: nil, keyEquivalent: ""))
+        addDisplayHeading("Pourcentage")
+        addDisplayOption("Disponible", #selector(showAvailable))
+        addDisplayOption("Utilisé", #selector(showUsed))
+        displayMenu.addItem(.separator())
+        addDisplayHeading("Services")
+        addDisplayOption("Défilement automatique", #selector(showAlternating))
+        addDisplayOption("ChatGPT et Claude côte à côte", #selector(showBothProviders))
+        addDisplayOption("ChatGPT seulement", #selector(showCodexOnly))
+        addDisplayOption("Claude seulement", #selector(showClaudeOnly))
+        displayMenu.addItem(.separator())
+        addDisplayHeading("Fenêtres de quota")
+        addDisplayOption("5 h et 7 j", #selector(showBothWindows))
+        addDisplayOption("5 h seulement", #selector(showSessionOnly))
+        addDisplayOption("7 j seulement", #selector(showWeeklyOnly))
+        displayMenu.addItem(.separator())
+        addDisplayHeading("Défilement")
+        displayMenu.addItem(countdownItem)
+        addDisplayOption("Toutes les 5 secondes", #selector(cycleEvery5))
+        addDisplayOption("Toutes les 10 secondes", #selector(cycleEvery10))
+        addDisplayOption("Toutes les 20 secondes", #selector(cycleEvery20))
+        addDisplayOption("Durée personnalisée…", #selector(customizeCycle))
+        addDisplayOption("Afficher le compte à rebours", #selector(toggleCountdown))
+        menu.setSubmenu(displayMenu, for: menu.addItem(withTitle: "Affichage", action: nil, keyEquivalent: ""))
 
         let refreshMenu = NSMenu()
         for (title, selector) in [
@@ -281,9 +188,8 @@ private final class QuotaController: NSObject, NSMenuDelegate {
             item.target = self
             refreshMenu.addItem(item)
         }
-        menu.setSubmenu(refreshMenu, for: menu.addItem(withTitle: "Actualisation automatique", action: nil, keyEquivalent: ""))
+        menu.setSubmenu(refreshMenu, for: menu.addItem(withTitle: "Actualisation", action: nil, keyEquivalent: ""))
 
-        menu.addItem(withTitle: "Lancer à l’ouverture de session", action: #selector(toggleLaunchAtLogin), keyEquivalent: "").target = self
         let alertsMenu = NSMenu()
         alertsMenu.addItem(alertThresholdItem)
         alertsMenu.addItem(.separator())
@@ -300,8 +206,10 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         alertsMenu.addItem(withTitle: "Seuil personnalisé…", action: #selector(customizeAlertThreshold), keyEquivalent: "").target = self
         menu.setSubmenu(alertsMenu, for: menu.addItem(withTitle: "Alertes de quota", action: nil, keyEquivalent: ""))
 
-        menu.addItem(withTitle: "Relier Claude Code (terminal)", action: #selector(enableClaude), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Actualiser", action: #selector(refresh), keyEquivalent: "r").target = self
+        menu.addItem(withTitle: "Lancer à l’ouverture de session", action: #selector(toggleLaunchAtLogin), keyEquivalent: "").target = self
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Relier Claude Code", action: #selector(enableClaude), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Actualiser maintenant", action: #selector(refresh), keyEquivalent: "r").target = self
         menu.addItem(withTitle: "Quitter AI Quota", action: #selector(quit), keyEquivalent: "q").target = self
 
         primaryStatusItem.menu = menu
@@ -549,28 +457,33 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private func render() {
         let codexSession = codexLimits?.rateLimits?.primary
         let codexWeek = codexLimits?.rateLimits?.secondary
-        let claude = ClaudeBridge.read()
         let now = Date().timeIntervalSince1970
+        let claude: ClaudeQuotaReading?
+        do {
+            claude = try ClaudeBridge.read()
+            claudeError = nil
+        } catch {
+            claude = nil
+            claudeError = error.localizedDescription
+        }
         let label = displayMode == .available ? "disponible" : "utilisé"
 
-        menu.item(withTitle: "Afficher")?.submenu?.item(withTitle: "Pourcentage disponible")?.state = displayMode == .available ? .on : .off
-        menu.item(withTitle: "Afficher")?.submenu?.item(withTitle: "Pourcentage utilisé")?.state = displayMode == .used ? .on : .off
-        let providerMenu = menu.item(withTitle: "Services affichés")?.submenu
-        providerMenu?.item(withTitle: "Défilement automatique")?.state = providerMode == .alternating ? .on : .off
-        providerMenu?.item(withTitle: "ChatGPT et Claude côte à côte")?.state = providerMode == .both ? .on : .off
-        providerMenu?.item(withTitle: "ChatGPT seulement")?.state = providerMode == .codex ? .on : .off
-        providerMenu?.item(withTitle: "Claude seulement")?.state = providerMode == .claude ? .on : .off
-        let windowMenu = menu.item(withTitle: "Quotas affichés")?.submenu
-        windowMenu?.item(withTitle: "5 h et 7 j")?.state = windowMode == .both ? .on : .off
-        windowMenu?.item(withTitle: "5 h seulement")?.state = windowMode == .session ? .on : .off
-        windowMenu?.item(withTitle: "7 j seulement")?.state = windowMode == .weekly ? .on : .off
-        let speedMenu = menu.item(withTitle: "Vitesse du défilement")?.submenu
-        speedMenu?.item(withTitle: "Toutes les 5 secondes")?.state = cycleSeconds == 5 ? .on : .off
-        speedMenu?.item(withTitle: "Toutes les 10 secondes")?.state = cycleSeconds == 10 ? .on : .off
-        speedMenu?.item(withTitle: "Toutes les 20 secondes")?.state = cycleSeconds == 20 ? .on : .off
-        speedMenu?.item(withTitle: "Durée personnalisée…")?.state = [5, 10, 20].contains(cycleSeconds) ? .off : .on
-        speedMenu?.item(withTitle: "Afficher le compte à rebours")?.state = showCountdown ? .on : .off
-        let refreshMenu = menu.item(withTitle: "Actualisation automatique")?.submenu
+        let displayMenu = menu.item(withTitle: "Affichage")?.submenu
+        displayMenu?.item(withTitle: "Disponible")?.state = displayMode == .available ? .on : .off
+        displayMenu?.item(withTitle: "Utilisé")?.state = displayMode == .used ? .on : .off
+        displayMenu?.item(withTitle: "Défilement automatique")?.state = providerMode == .alternating ? .on : .off
+        displayMenu?.item(withTitle: "ChatGPT et Claude côte à côte")?.state = providerMode == .both ? .on : .off
+        displayMenu?.item(withTitle: "ChatGPT seulement")?.state = providerMode == .codex ? .on : .off
+        displayMenu?.item(withTitle: "Claude seulement")?.state = providerMode == .claude ? .on : .off
+        displayMenu?.item(withTitle: "5 h et 7 j")?.state = windowMode == .both ? .on : .off
+        displayMenu?.item(withTitle: "5 h seulement")?.state = windowMode == .session ? .on : .off
+        displayMenu?.item(withTitle: "7 j seulement")?.state = windowMode == .weekly ? .on : .off
+        displayMenu?.item(withTitle: "Toutes les 5 secondes")?.state = cycleSeconds == 5 ? .on : .off
+        displayMenu?.item(withTitle: "Toutes les 10 secondes")?.state = cycleSeconds == 10 ? .on : .off
+        displayMenu?.item(withTitle: "Toutes les 20 secondes")?.state = cycleSeconds == 20 ? .on : .off
+        displayMenu?.item(withTitle: "Durée personnalisée…")?.state = [5, 10, 20].contains(cycleSeconds) ? .off : .on
+        displayMenu?.item(withTitle: "Afficher le compte à rebours")?.state = showCountdown ? .on : .off
+        let refreshMenu = menu.item(withTitle: "Actualisation")?.submenu
         refreshMenu?.item(withTitle: "Activée")?.state = refreshEnabled ? .on : .off
         refreshMenu?.item(withTitle: "Toutes les 30 secondes")?.state = refreshSeconds == 30 ? .on : .off
         refreshMenu?.item(withTitle: "Toutes les 1 minute")?.state = refreshSeconds == 60 ? .on : .off
@@ -585,45 +498,52 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         alertThresholdItem.title = alertThreshold > 0 ? "Seuil actuel : \(alertThreshold) % disponibles" : "Seuil actuel : désactivé"
 
         let codexFresh = codexError == nil && (codexCapturedAt.map { now - $0 <= max(300, TimeInterval(refreshSeconds * 2)) } ?? false)
-        let claudeFresh = claude.map { now - $0.capturedAt <= $0.maxAge } ?? false
+        let claudeFiveFresh = claude?.fiveHour?.isFresh(at: now) ?? false
+        let claudeSevenFresh = claude?.sevenDay?.isFresh(at: now) ?? false
+        let claudeFiveHasFreshReset = claude?.fiveHour?.freshReset(at: now) != nil
+        let claudeSevenHasFreshReset = claude?.sevenDay?.freshReset(at: now) != nil
+        let claudeMeasurement = claude?.latestMeasurement
+        let claudeFresh = claudeFiveFresh || claudeSevenFresh
         codexAgeItem.title = "ChatGPT · dernière mesure : \(ageText(codexCapturedAt, now: now))\(codexFresh ? "" : " · ancienne")"
-        claudeAgeItem.title = "Claude · dernière mesure : \(ageText(claude?.capturedAt, now: now))\(claudeFresh ? "" : " · ancienne")"
+        if let claudeMeasurement {
+            claudeAgeItem.title = "Claude · \(claudeMeasurement.source.rawValue) · mesure \(claudeFresh ? "" : "ancienne · ")\(ageText(claudeMeasurement.capturedAt, now: now))"
+        } else {
+            claudeAgeItem.title = claudeError.map { "Claude · \($0)" } ?? "Claude · en attente d’une première mesure"
+        }
         chatgptSessionResetItem.title = "ChatGPT 5 h · \(resetText(codexSession?.resetsAt, fresh: codexFresh))"
         chatgptWeeklyResetItem.title = "ChatGPT 7 j · \(resetText(codexWeek?.resetsAt, fresh: codexFresh))"
-        let claudeFallback = claude?.source == "Claude Desktop" ? "non fourni par Claude Desktop" : "indisponible"
-        claudeSessionResetItem.title = "Claude 5 h · \(resetText(claude?.sessionReset, fresh: claudeFresh, fallback: claudeFallback))"
-        claudeWeeklyResetItem.title = "Claude 7 j · \(resetText(claude?.weeklyReset, fresh: claudeFresh, fallback: claudeFallback))"
+        claudeSessionResetItem.title = "Claude 5 h · \(resetText(claude?.fiveHour?.freshReset(at: now), fresh: claudeFiveHasFreshReset))"
+        claudeWeeklyResetItem.title = "Claude 7 j · \(resetText(claude?.sevenDay?.freshReset(at: now), fresh: claudeSevenHasFreshReset))"
         if codexFresh {
             if let value = codexSession?.usedPercent { checkAlert(provider: .codex, window: "5h", used: value) }
             if let value = codexWeek?.usedPercent { checkAlert(provider: .codex, window: "7j", used: value) }
         }
-        if claudeFresh {
-            if let value = claude?.sessionUsed { checkAlert(provider: .claude, window: "5h", used: value) }
-            if let value = claude?.weeklyUsed { checkAlert(provider: .claude, window: "7j", used: value) }
+        if claudeFiveFresh, let value = claude?.fiveHour?.usedPercent {
+            checkAlert(provider: .claude, window: "5h", used: value)
+        }
+        if claudeSevenFresh, let value = claude?.sevenDay?.usedPercent {
+            checkAlert(provider: .claude, window: "7j", used: value)
         }
 
         func texts(for provider: Provider) -> (String, String, [NSRange]) {
-            let sessionUsed = provider == .codex ? codexSession?.usedPercent : claude?.sessionUsed
-            let weeklyUsed = provider == .codex ? codexWeek?.usedPercent : claude?.weeklyUsed
-            let sessionReset = provider == .codex ? codexSession?.resetsAt : claude?.sessionReset
-            let weeklyReset = provider == .codex ? codexWeek?.resetsAt : claude?.weeklyReset
-            let fresh = provider == .codex ? codexFresh : claudeFresh
-            let sessionValid = fresh && (sessionReset.map { $0 > now } ?? true)
-            let weeklyValid = fresh && (weeklyReset.map { $0 > now } ?? true)
+            let sessionUsed = provider == .codex ? codexSession?.usedPercent : claude?.fiveHour?.usedPercent
+            let weeklyUsed = provider == .codex ? codexWeek?.usedPercent : claude?.sevenDay?.usedPercent
+            let sessionValid = provider == .codex ? codexFresh : claudeFiveFresh
+            let weeklyValid = provider == .codex ? codexFresh : claudeSevenFresh
             let sessionText = sessionValid ? sessionUsed.map(number) ?? "—" : "—"
             let weeklyText = weeklyValid ? weeklyUsed.map(number) ?? "—" : "—"
             let title: String
             switch windowMode {
-            case .both: title = "5h \(sessionText) · 7j \(weeklyText)"
-            case .session: title = "5h \(sessionText)"
-            case .weekly: title = "7j \(weeklyText)"
+            case .both: title = "5 h \(sessionText) · 7 j \(weeklyText)"
+            case .session: title = "5 h \(sessionText)"
+            case .weekly: title = "7 j \(weeklyText)"
             }
             let name = provider == .codex ? "ChatGPT" : "Claude"
-            let capturedAt = provider == .codex ? codexCapturedAt : claude?.capturedAt
+            let capturedAt = provider == .codex ? codexCapturedAt : claude?.latestMeasurement?.capturedAt
             var redRanges: [NSRange] = []
             for (prefix, text, used, visible) in [
-                ("5h ", sessionText, sessionUsed, windowMode != .weekly && sessionValid),
-                ("7j ", weeklyText, weeklyUsed, windowMode != .session && weeklyValid)
+                ("5 h ", sessionText, sessionUsed, windowMode != .weekly && sessionValid),
+                ("7 j ", weeklyText, weeklyUsed, windowMode != .session && weeklyValid)
             ] where visible && (used.map { 100 - $0 < 10 } ?? false) {
                 let full = title as NSString
                 let range = full.range(of: prefix + text)
@@ -631,7 +551,9 @@ private final class QuotaController: NSObject, NSMenuDelegate {
                     redRanges.append(NSRange(location: range.location + (prefix as NSString).length, length: (text as NSString).length))
                 }
             }
-            return (title, "\(name) : 5h \(sessionText), 7j \(weeklyText) \(label) · mesure \(ageText(capturedAt, now: now))", redRanges)
+            let sessionLabel = sessionValid ? "\(sessionText) \(label)" : "indisponible"
+            let weeklyLabel = weeklyValid ? "\(weeklyText) \(label)" : "indisponible"
+            return (title, "\(name) · 5 h \(sessionLabel) · 7 j \(weeklyLabel) · mesure \(ageText(capturedAt, now: now))", redRanges)
         }
 
         func show(_ provider: Provider, on statusItem: NSStatusItem) {
@@ -663,11 +585,16 @@ private final class QuotaController: NSObject, NSMenuDelegate {
             show(.claude, on: primaryStatusItem)
             secondaryStatusItem.isVisible = false
         }
-        codexItem.title = "ChatGPT · 5h \(codexFresh ? (codexSession.map { number($0.usedPercent) } ?? "—") : "—") · 7j \(codexFresh ? (codexWeek.map { number($0.usedPercent) } ?? "—") : "—") \(label)"
+        let unavailable = "indisponible"
+        codexItem.title = "ChatGPT · 5 h \(codexFresh ? "\(codexSession.map { number($0.usedPercent) } ?? unavailable) \(label)" : unavailable) · 7 j \(codexFresh ? "\(codexWeek.map { number($0.usedPercent) } ?? unavailable) \(label)" : unavailable)"
         if let claude {
-            let stale = now - claude.capturedAt > claude.maxAge
-            let prefix = stale ? "Claude · mesure ancienne" : "Claude"
-            claudeItem.title = "\(prefix) · 5h \(claude.sessionUsed.map(number) ?? "—") · 7j \(claude.weeklyUsed.map(number) ?? "—") · \(claude.source) à \(formatted(claude.capturedAt))"
+            func summary(_ window: ClaudeQuotaWindow?, fresh: Bool) -> String {
+                guard fresh, let used = window?.usedPercent else { return unavailable }
+                return "\(number(used)) \(label)"
+            }
+            claudeItem.title = "Claude · 5 h \(summary(claude.fiveHour, fresh: claudeFiveFresh)) · 7 j \(summary(claude.sevenDay, fresh: claudeSevenFresh))"
+        } else {
+            claudeItem.title = claudeError.map { "Claude · \($0)" } ?? "Claude · en attente d’une première mesure"
         }
         if let codexError { codexItem.title = "ChatGPT : \(codexError)" }
     }
@@ -743,10 +670,21 @@ if CommandLine.arguments.contains("--diagnose-codex") {
 } else if CommandLine.arguments.contains("--claude-statusline") {
     ClaudeBridge.captureStatusLine()
 } else if CommandLine.arguments.contains("--diagnose-claude") {
-    if let reading = ClaudeBridge.read() {
-        print("\(reading.source) · 5h \(reading.sessionUsed.map { String(Int($0.rounded())) } ?? "—")% · 7j \(reading.weeklyUsed.map { String(Int($0.rounded())) } ?? "—")% · mesure \(Date(timeIntervalSince1970: reading.capturedAt))")
-    } else {
-        print("Aucune mesure Claude disponible.")
+    do {
+        guard let reading = try ClaudeBridge.read() else {
+            print("Aucune mesure Claude disponible ; une première réponse éligible est nécessaire.")
+            exit(EXIT_FAILURE)
+        }
+        let now = Date().timeIntervalSince1970
+        func value(_ window: ClaudeQuotaWindow?) -> String {
+            guard let window, window.isFresh(at: now), let used = window.usedPercent else { return "indisponible" }
+            return "\(Int(used.rounded())) % utilisé"
+        }
+        let measurement = reading.latestMeasurement
+        let timestamp = measurement.map { Date(timeIntervalSince1970: $0.capturedAt).formatted(date: .abbreviated, time: .shortened) } ?? "indisponible"
+        print("\(measurement?.source.rawValue ?? "Claude") · 5 h \(value(reading.fiveHour)) · 7 j \(value(reading.sevenDay)) · mesure \(timestamp)")
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
         exit(EXIT_FAILURE)
     }
 } else if CommandLine.arguments.contains("--install-claude-statusline") {

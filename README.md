@@ -24,24 +24,21 @@ Pour créer une version optimisée :
 
 L’app affiche par exemple `logo bleu 5h 84% · 7j 80%`, puis `logo orange 5h 84% · 7j 80%` dans la barre de menus. Dans le menu, choisis :
 
-- **Afficher** : pourcentage **disponible** ou **utilisé**.
-- **Services affichés** : défilement automatique, les deux côte à côte, ChatGPT seulement ou Claude seulement.
-- **Quotas affichés** : 5 h et 7 j, 5 h seulement ou 7 j seulement.
-- **Vitesse du défilement** : toutes les 5, 10 ou 20 secondes, ou une durée personnalisée de 2 à 300 secondes. Le menu affiche le temps restant avant le prochain changement ; tu peux aussi afficher ce compte à rebours dans la barre de menus.
-- **Actualisation automatique** : activée par défaut, avec une fréquence de 30 secondes, 1 minute ou 5 minutes. « Actualiser » reste disponible à tout moment.
-- **Lancer à l’ouverture de session** : active ou désactive le démarrage automatique dans les réglages macOS. Cette option nécessite de lancer l’app compilée `AI Quota.app` (et non `swift run`).
-- **Alertes de quota** : notifications facultatives sous 10, 20 ou 30 % disponibles, ou avec un seuil personnalisé entre 1 et 99 %. Le seuil s’applique séparément à chaque service et chaque fenêtre. macOS demande une autorisation la première fois ; l’app n’envoie pas la même alerte à chaque actualisation.
-- Les dates de réinitialisation 5 h et 7 j apparaissent directement sous le quota de chaque service dans le menu, avec la date, l’heure locale et le fuseau lorsqu’elles sont disponibles.
+- **Affichage** regroupe le pourcentage restant ou utilisé, les services, les fenêtres 5 h / 7 j et le défilement. Tu peux afficher les deux services côte à côte ou en alterner un seul dans la barre de menus.
+- **Actualisation** : activée par défaut, toutes les 30 secondes, 1 minute ou 5 minutes. « Actualiser maintenant » lance une lecture immédiate.
+- **Alertes de quota** : notifications facultatives sous 10, 20 ou 30 % disponibles, ou à un seuil personnalisé. Le seuil s’applique séparément à chaque service et fenêtre.
+- **Lancer à l’ouverture de session** active ou désactive le démarrage macOS ; cette option nécessite `AI Quota.app` et non `swift run`.
+- Les resets, la dernière mesure, sa source et son ancienneté apparaissent avec les quotas. Les pourcentages anciens ou indisponibles restent indiqués comme tels.
 
 Ces choix sont mémorisés. Le défilement automatique passe d’un service à l’autre toutes les 10 secondes par défaut ; les données sont relues chaque minute par défaut.
 
-Pour Claude Desktop, le widget lit automatiquement la dernière mesure locale enregistrée par l’app. Pour Claude Code dans le terminal, le menu « Relier Claude Code (terminal) » configure sa [ligne de statut officielle](https://code.claude.com/docs/en/statusline) avec une actualisation toutes les 60 secondes pendant une session ouverte. Si une ligne de statut personnalisée existe déjà, l'app ne la remplace pas ; intègre alors la commande `AIQuota --claude-statusline` à ton script existant en lui transmettant son JSON d'entrée.
+Claude Code est la source privilégiée lorsqu’elle fournit un quota plus récent : sa [ligne de statut officiellement prise en charge](https://code.claude.com/docs/en/statusline) transmet les fenêtres 5 h et 7 j et leurs resets après une réponse éligible. « Relier Claude Code » ajoute cette commande à `~/.claude/settings.json` uniquement si aucune ligne de statut personnalisée n’existe. Les sessions existantes ne sont pas remplacées ; tu peux appeler `AIQuota --claude-statusline` depuis ton propre script.
 
-Les mesures Claude Desktop peuvent avoir environ 15 minutes de retard. Le widget affiche `—` lorsqu’aucune mesure récente n’est disponible : 30 minutes pour Claude Desktop, 15 minutes pour la ligne de statut Claude Code. La source et l’heure de la dernière mesure figurent dans le menu.
+Claude Desktop sert de source locale de secours via `~/Library/Application Support/Claude/plan-usage-history.json`. Ce fichier interne n’est pas une API publique et son format peut changer. Son historique fournit des pourcentages, sans reset. AI Quota garde les resets fournis par une mesure récente de Claude Code. Une mesure Code âgée de plus de 15 minutes ou Desktop âgée de plus de 30 minutes est marquée ancienne et ne fournit plus de pourcentage au badge. Sans mesure, le menu indique qu’une première réponse Claude Code est nécessaire ou affiche l’erreur de lecture.
 
 Le menu indique également l’âge du dernier relevé ChatGPT et Claude. Une mesure ChatGPT devient ancienne si elle n’a pas été renouvelée depuis au moins 5 minutes (ou deux intervalles d’actualisation, si c’est plus long). Dans ce cas, le widget affiche `—` au lieu de présenter un quota périmé comme actuel. Dans la barre de menus, tout pourcentage correspondant à **moins de 10 % disponibles** passe en rouge, même si tu as choisi l’affichage en pourcentage utilisé.
 
-Les dates de reset ChatGPT sont fournies par son service local. Claude Code fournit celles de Claude via sa ligne de statut après la première réponse d’une session éligible. L’app peut combiner ces dates avec les pourcentages plus récents de Claude Desktop. Le fichier local de Claude Desktop ne contient pas ces dates : si aucune session Claude Code n’a fourni de données récentes, le menu indique « non fourni par Claude Desktop » plutôt que d’estimer une date. Aucun identifiant ni jeton Claude n’est lu par le widget.
+Les dates de reset ChatGPT viennent de son service local. Celles de Claude ne sont affichées que si une mesure Claude Code récente fournit un reset futur valide ; l’historique Claude Desktop n’en fournit pas. Aucun identifiant ni jeton Claude n’est lu par le widget.
 
 Fermer le Terminal ferme `swift run`, car c’est le processus de développement. Le script crée `AI Quota.app` à la racine du projet et la lance : elle continuera à tourner sans Terminal. Tu peux ensuite déplacer cette app dans le dossier Applications ou l’ajouter au Dock.
 
