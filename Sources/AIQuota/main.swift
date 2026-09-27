@@ -3,20 +3,7 @@ import Foundation
 import ServiceManagement
 import UserNotifications
 
-private struct UsageWindow: Decodable, Sendable {
-    let usedPercent: Double
-    let windowDurationMins: Int
-    let resetsAt: TimeInterval
-}
-
-private struct RateLimits: Decodable, Sendable {
-    let primary: UsageWindow?
-    let secondary: UsageWindow?
-}
-
-private struct RateLimitResponse: Decodable, Sendable {
-    let rateLimits: RateLimits
-}
+import QuotaCore
 
 private struct ClaudeWindow: Codable {
     let used_percentage: Double
@@ -170,6 +157,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private let client = CodexAppServerClient()
     private var refreshTimer: Timer?
     private var cycleTimer: Timer?
+    private var codexError: String?
     private var codexLimits: RateLimitResponse?
     private var codexCapturedAt: TimeInterval?
     private var alertThreshold = UserDefaults.standard.integer(forKey: "quotaAlertThreshold")
@@ -325,7 +313,12 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         Task { [weak self] in
             guard let self else { return }
             await client.setRateLimitsChangedHandler { [weak self] data in
-                Task { @MainActor in self?.updateCodex(data) }
+                Task { @MainActor in
+                    switch data {
+                    case .success(let reading): self?.updateCodex(reading)
+                    case .failure(let error): self?.failCodex(error)
+                    }
+                }
             }
             await refreshAsync()
         }
@@ -536,19 +529,26 @@ private final class QuotaController: NSObject, NSMenuDelegate {
 
     private func refreshAsync() async {
         do { updateCodex(try await client.readRateLimits()) }
-        catch { codexItem.title = "ChatGPT : \(error.localizedDescription)"; render() }
+        catch { failCodex(error) }
+    }
+
+    private func failCodex(_ error: any Error) {
+        codexError = error.localizedDescription
+        codexLimits = nil
+        codexCapturedAt = nil
         render()
     }
 
     private func updateCodex(_ data: RateLimitResponse) {
+        codexError = nil
         codexLimits = data
         codexCapturedAt = Date().timeIntervalSince1970
         render()
     }
 
     private func render() {
-        let codexSession = codexLimits?.rateLimits.primary
-        let codexWeek = codexLimits?.rateLimits.secondary
+        let codexSession = codexLimits?.rateLimits?.primary
+        let codexWeek = codexLimits?.rateLimits?.secondary
         let claude = ClaudeBridge.read()
         let now = Date().timeIntervalSince1970
         let label = displayMode == .available ? "disponible" : "utilisé"
@@ -584,7 +584,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         alertsMenu?.item(withTitle: "Seuil personnalisé…")?.state = alertThreshold > 0 && ![10, 20, 30].contains(alertThreshold) ? .on : .off
         alertThresholdItem.title = alertThreshold > 0 ? "Seuil actuel : \(alertThreshold) % disponibles" : "Seuil actuel : désactivé"
 
-        let codexFresh = codexCapturedAt.map { now - $0 <= max(300, TimeInterval(refreshSeconds * 2)) } ?? false
+        let codexFresh = codexError == nil && (codexCapturedAt.map { now - $0 <= max(300, TimeInterval(refreshSeconds * 2)) } ?? false)
         let claudeFresh = claude.map { now - $0.capturedAt <= $0.maxAge } ?? false
         codexAgeItem.title = "ChatGPT · dernière mesure : \(ageText(codexCapturedAt, now: now))\(codexFresh ? "" : " · ancienne")"
         claudeAgeItem.title = "Claude · dernière mesure : \(ageText(claude?.capturedAt, now: now))\(claudeFresh ? "" : " · ancienne")"
@@ -663,14 +663,13 @@ private final class QuotaController: NSObject, NSMenuDelegate {
             show(.claude, on: primaryStatusItem)
             secondaryStatusItem.isVisible = false
         }
-        if let session = codexSession {
-            codexItem.title = "ChatGPT · 5h \(codexFresh ? number(session.usedPercent) : "—") · 7j \(codexFresh ? (codexWeek.map { number($0.usedPercent) } ?? "—") : "—") \(label)"
-        }
+        codexItem.title = "ChatGPT · 5h \(codexFresh ? (codexSession.map { number($0.usedPercent) } ?? "—") : "—") · 7j \(codexFresh ? (codexWeek.map { number($0.usedPercent) } ?? "—") : "—") \(label)"
         if let claude {
             let stale = now - claude.capturedAt > claude.maxAge
             let prefix = stale ? "Claude · mesure ancienne" : "Claude"
             claudeItem.title = "\(prefix) · 5h \(claude.sessionUsed.map(number) ?? "—") · 7j \(claude.weeklyUsed.map(number) ?? "—") · \(claude.source) à \(formatted(claude.capturedAt))"
         }
+        if let codexError { codexItem.title = "ChatGPT : \(codexError)" }
     }
 
     private func number(_ used: Double) -> String {
@@ -722,80 +721,26 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         Task { try? await UNUserNotificationCenter.current().add(request) }
     }
 
-    @objc private func quit() { NSApplication.shared.terminate(nil) }
-}
-
-private actor CodexAppServerClient {
-    private var process: Process?
-    private var input: FileHandle?
-    private var continuations: [Int: CheckedContinuation<Data, Error>] = [:]
-    private var nextID = 1
-    private var onRateLimitsChanged: (@Sendable (RateLimitResponse) -> Void)?
-    private var buffer = Data()
-
-    func setRateLimitsChangedHandler(_ handler: @escaping @Sendable (RateLimitResponse) -> Void) { onRateLimitsChanged = handler }
-
-    func readRateLimits() async throws -> RateLimitResponse {
-        try await connectIfNeeded()
-        let response = try await request(method: "account/rateLimits/read", params: [:])
-        return try JSONDecoder().decode(RateLimitResponse.self, from: response)
-    }
-
-    private func connectIfNeeded() async throws {
-        if process?.isRunning == true { return }
-        let candidates = ["/Applications/ChatGPT.app/Contents/Resources/codex", "/usr/local/bin/codex", "/opt/homebrew/bin/codex"]
-        guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw NSError(domain: "AIQuota", code: 1, userInfo: [NSLocalizedDescriptionKey: "Composant ChatGPT introuvable."])
-        }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: executable)
-        task.arguments = ["app-server"]
-        let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
-        task.standardInput = stdin
-        task.standardOutput = stdout
-        task.standardError = stderr
-        try task.run()
-        process = task
-        input = stdin.fileHandleForWriting
-        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let chunk = handle.availableData
-            guard !chunk.isEmpty else { return }
-            Task { await self?.consume(chunk) }
-        }
-        _ = try await request(method: "initialize", params: ["clientInfo": ["name": "ai_quota", "title": "AI Quota", "version": "2.0"]])
-        send(["method": "initialized", "params": [:]])
-    }
-
-    private func consume(_ chunk: Data) {
-        buffer.append(chunk)
-        while let newline = buffer.firstIndex(of: 10) {
-            let line = buffer.prefix(upTo: newline)
-            buffer.removeSubrange(...newline)
-            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
-            if let id = object["id"] as? Int, let continuation = continuations.removeValue(forKey: id) {
-                if let result = object["result"], let data = try? JSONSerialization.data(withJSONObject: result) { continuation.resume(returning: data) }
-                else { continuation.resume(throwing: NSError(domain: "AIQuota", code: 2, userInfo: [NSLocalizedDescriptionKey: "Réponse ChatGPT invalide."])) }
-            } else if object["method"] as? String == "account/rateLimits/updated",
-                      let params = object["params"], let data = try? JSONSerialization.data(withJSONObject: params),
-                      let limits = try? JSONDecoder().decode(RateLimitResponse.self, from: data) { onRateLimitsChanged?(limits) }
-        }
-    }
-
-    private func request(method: String, params: [String: Any]) async throws -> Data {
-        let id = nextID; nextID += 1
-        return try await withCheckedThrowingContinuation { continuation in
-            continuations[id] = continuation
-            send(["method": method, "id": id, "params": params])
-        }
-    }
-
-    private func send(_ object: [String: Any]) {
-        guard let input, let data = try? JSONSerialization.data(withJSONObject: object) else { return }
-        input.write(data + Data([10]))
+    @objc private func quit() {
+        Task { await client.shutdown(); NSApplication.shared.terminate(nil) }
     }
 }
 
-if CommandLine.arguments.contains("--claude-statusline") {
+if CommandLine.arguments.contains("--diagnose-codex") {
+    Task {
+        do {
+            let client = CodexAppServerClient()
+            let reading = try await client.readRateLimits()
+            await client.shutdown()
+            print("Codex · 5h \(reading.rateLimits?.primary.map { String($0.usedPercent) } ?? "—")% · 7j \(reading.rateLimits?.secondary.map { String($0.usedPercent) } ?? "—")%")
+            exit(EXIT_SUCCESS)
+        } catch {
+            FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+            exit(EXIT_FAILURE)
+        }
+    }
+    RunLoop.main.run()
+} else if CommandLine.arguments.contains("--claude-statusline") {
     ClaudeBridge.captureStatusLine()
 } else if CommandLine.arguments.contains("--diagnose-claude") {
     if let reading = ClaudeBridge.read() {

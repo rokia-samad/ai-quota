@@ -1,0 +1,36 @@
+name: Swift validation
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests (offline fixtures)
+        run: ./scripts/test.sh
+      - name: Release build and Swift type checking
+        run: swift build -c release
+      - name: Fetch comparison commit
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git fetch --no-tags --depth=1 origin "$PR_BASE"
+          elif [[ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            git fetch --no-tags --depth=1 origin "$PUSH_BEFORE"
+          fi
+      - name: Diff whitespace
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git diff --check "$PR_BASE" "$GITHUB_SHA"
+          elif [[ "$PUSH_BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            git diff-tree --check --root --no-commit-id -r "$GITHUB_SHA"
+          else
+            git diff --check "$PUSH_BEFORE..$GITHUB_SHA"
+          fi
