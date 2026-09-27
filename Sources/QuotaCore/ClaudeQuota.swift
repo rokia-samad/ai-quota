@@ -276,7 +276,11 @@ public enum ClaudeQuota {
   private static func combine(_ desktop: Candidate?, _ code: Candidate?, now: Double)
     -> ClaudeQuotaWindow?
   {
-    let usage = [desktop, code].compactMap { $0 }.filter { $0.used != nil }
+    let candidates = [desktop, code].compactMap { $0 }.filter { $0.used != nil }
+    let freshUsage = candidates.filter {
+      $0.capturedAt <= now && now - $0.capturedAt <= $0.source.maxAge
+    }
+    let usage = (freshUsage.isEmpty ? candidates : freshUsage)
       .max(by: { $0.capturedAt < $1.capturedAt })
     let reset = code.flatMap { candidate in
       candidate.capturedAt <= now && now - candidate.capturedAt <= ClaudeQuotaSource.code.maxAge

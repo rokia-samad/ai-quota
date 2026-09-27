@@ -51,6 +51,36 @@ private func claudeRead(
   #expect(reading.sevenDay?.source == .desktop)
 }
 
+@Test func freshDesktopWinsOverNewerButStaleCodeUsage() throws {
+  let desktopCapturedAt = claudeNow - 25 * 60
+  let codeCapturedAt = claudeNow - 20 * 60
+  let desktop = Data(
+    #"{"samples":[{"t":\#(desktopCapturedAt * 1_000),"u":{"fh":50}}]}"#.utf8)
+  let status = Data(
+    #"{"rate_limits":{"five_hour":{"used_percentage":25}},"captured_at":\#(codeCapturedAt)}"#.utf8)
+
+  let reading = try claudeRead(desktop: desktop, status: status)!
+
+  #expect(reading.fiveHour?.source == .desktop)
+  #expect(reading.fiveHour?.usedPercent == 50)
+  #expect(reading.fiveHour?.isFresh(at: claudeNow) == true)
+}
+
+@Test func freshCodeWinsOverOlderFreshDesktopUsage() throws {
+  let desktopCapturedAt = claudeNow - 10 * 60
+  let codeCapturedAt = claudeNow - 5 * 60
+  let desktop = Data(
+    #"{"samples":[{"t":\#(desktopCapturedAt * 1_000),"u":{"fh":50}}]}"#.utf8)
+  let status = Data(
+    #"{"rate_limits":{"five_hour":{"used_percentage":25}},"captured_at":\#(codeCapturedAt)}"#.utf8)
+
+  let reading = try claudeRead(desktop: desktop, status: status)!
+
+  #expect(reading.fiveHour?.source == .code)
+  #expect(reading.fiveHour?.usedPercent == 25)
+  #expect(reading.fiveHour?.isFresh(at: claudeNow) == true)
+}
+
 @Test func missingAndPartialWindowsStayUnavailable() throws {
   let status = Data(
     #"{"rate_limits":{"five_hour":{"used_percentage":22}},"captured_at":1699999995}"#.utf8)
