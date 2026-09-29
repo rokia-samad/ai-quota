@@ -40,9 +40,7 @@ public actor CodexAppServerClient {
 
   private func start() async throws {
     guard let executable = executable ?? CodexExecutable.resolve() else {
-      throw NSError(
-        domain: "AIQuota", code: 1,
-        userInfo: [NSLocalizedDescriptionKey: "Composant ChatGPT introuvable."])
+      throw Self.error(code: 1, "Composant ChatGPT introuvable.")
     }
     let task = Process()
     task.executableURL = URL(fileURLWithPath: executable)
@@ -52,6 +50,8 @@ public actor CodexAppServerClient {
     task.standardInput = stdin
     task.standardOutput = stdout
     task.standardError = FileHandle.nullDevice
+    // A write racing the server's exit must fail with EPIPE instead of killing the app.
+    _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
     generation = UUID()
     let current = generation
     task.terminationHandler = { [weak self] _ in Task { await self?.disconnect(current) } }
@@ -91,7 +91,13 @@ public actor CodexAppServerClient {
       guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
         continue
       }
-      if let id = object["id"] as? Int, let continuation = continuations.removeValue(forKey: id) {
+      if object["method"] != nil, let id = object["id"] {
+        // Server-initiated request: its id lives in another namespace than ours. Decline it so
+        // the server does not wait for an answer this client cannot give.
+        send(["id": id, "error": ["code": -32601, "message": "Method not supported"]])
+      } else if let id = object["id"] as? Int,
+        let continuation = continuations.removeValue(forKey: id)
+      {
         if let result = object["result"],
           let data = try? JSONSerialization.data(withJSONObject: result)
         {
@@ -99,12 +105,10 @@ public actor CodexAppServerClient {
         } else {
           let code = (object["error"] as? [String: Any])?["code"] as? Int ?? 2
           continuation.resume(
-            throwing: NSError(
-              domain: "AIQuota", code: code,
-              userInfo: [
-                NSLocalizedDescriptionKey:
-                  "Échec du service Codex (code \(code)). Vérifie la connexion du compte dans Codex/ChatGPT."
-              ]))
+            throwing: Self.error(
+              code: code,
+              "Échec du service Codex (code \(code)). Vérifie la connexion du compte dans Codex/ChatGPT."
+            ))
         }
       } else if object["method"] as? String == "account/rateLimits/updated" {
         do {
@@ -113,7 +117,8 @@ public actor CodexAppServerClient {
           onRateLimitsChanged?(
             .success(try JSONDecoder().decode(RateLimitResponse.self, from: data)))
         } catch {
-          onRateLimitsChanged?(.failure(CocoaError(.coderReadCorrupt)))
+          onRateLimitsChanged?(
+            .failure(Self.error(code: 4, "Mise à jour des quotas Codex invalide.")))
         }
       }
     }
@@ -143,17 +148,21 @@ public actor CodexAppServerClient {
     buffer.removeAll()
     for continuation in pending.values {
       continuation.resume(
-        throwing: NSError(
-          domain: "AIQuota", code: 3,
-          userInfo: [
-            NSLocalizedDescriptionKey:
-              "Service Codex interrompu ou délai dépassé. Réessaie l’actualisation."
-          ]))
+        throwing: Self.error(
+          code: 3, "Service Codex interrompu ou délai dépassé. Réessaie l’actualisation."))
     }
   }
 
+  /// Any failure to deliver a message drops the connection, so pending requests fail now
+  /// instead of waiting for the timeout, and the next refresh reconnects.
   private func send(_ object: [String: Any]) {
-    guard let input, let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+    guard let input, let data = try? JSONSerialization.data(withJSONObject: object) else {
+      return disconnect(generation)
+    }
     do { try input.write(contentsOf: data + Data([10])) } catch { disconnect(generation) }
+  }
+
+  private static func error(code: Int, _ message: String) -> NSError {
+    NSError(domain: "AIQuota", code: code, userInfo: [NSLocalizedDescriptionKey: message])
   }
 }

@@ -59,6 +59,9 @@ public enum ClaudeQuotaError: Error, LocalizedError, Equatable {
 }
 
 public enum ClaudeQuota {
+  /// Year 10000: later "timestamps" are garbage rather than dates.
+  private static let maxTimestamp: Double = 253_402_300_800
+
   private struct StatusRecord: Codable {
     let rateLimits: StatusLimits?
     let capturedAt: Double
@@ -154,7 +157,7 @@ public enum ClaudeQuota {
       let validPercentage = percentage.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
       let reset = jsonNumber(raw["resets_at"])
       let validReset = reset.flatMap {
-        $0.isFinite && $0 > capturedAt && $0 < 253_402_300_800 ? $0 : nil
+        $0.isFinite && $0 > capturedAt && $0 < maxTimestamp ? $0 : nil
       }
       guard validPercentage != nil || validReset != nil else { return nil }
       return StatusLimit(usedPercentage: validPercentage, resetsAt: validReset)
@@ -175,28 +178,17 @@ public enum ClaudeQuota {
     let statusRead = readOptional(statusURL, source: ClaudeQuotaSource.code.rawValue)
     if let error = desktopRead.error { errors.append(error) }
     if let error = statusRead.error { errors.append(error) }
-    let desktopData = desktopRead.data
-    let statusData = statusRead.data
-    let desktop: Parsed? = {
-      guard let desktopData else { return nil }
-      do { return try parseDesktop(desktopData, now: now) } catch let error as ClaudeQuotaError {
-        errors.append(error)
-        return nil
-      } catch {
-        errors.append(.malformed(ClaudeQuotaSource.desktop.rawValue))
+    func parse(
+      _ data: Data?, _ source: ClaudeQuotaSource, _ parser: (Data, Double) throws -> Parsed?
+    ) -> Parsed? {
+      guard let data else { return nil }
+      do { return try parser(data, now) } catch {
+        errors.append(error as? ClaudeQuotaError ?? .malformed(source.rawValue))
         return nil
       }
-    }()
-    let status: Parsed? = {
-      guard let statusData else { return nil }
-      do { return try parseStatus(statusData, now: now) } catch let error as ClaudeQuotaError {
-        errors.append(error)
-        return nil
-      } catch {
-        errors.append(.malformed(ClaudeQuotaSource.code.rawValue))
-        return nil
-      }
-    }()
+    }
+    let desktop = parse(desktopRead.data, .desktop, parseDesktop)
+    let status = parse(statusRead.data, .code, parseStatus)
     let fiveHour = combine(desktop?.fiveHour, status?.fiveHour, now: now)
     let sevenDay = combine(desktop?.sevenDay, status?.sevenDay, now: now)
     if fiveHour == nil && sevenDay == nil {
@@ -221,6 +213,10 @@ public enum ClaudeQuota {
     let capturedAt: Double
     let source: ClaudeQuotaSource
     let reset: Double?
+
+    func isFresh(at now: Double, maxAge: TimeInterval) -> Bool {
+      capturedAt <= now && now - capturedAt <= maxAge
+    }
   }
 
   private struct Parsed {
@@ -245,7 +241,7 @@ public enum ClaudeQuota {
       guard let window else { return nil }
       let used = window.usedPercentage.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
       let reset = window.resetsAt.flatMap {
-        $0.isFinite && $0 > now && $0 < 253_402_300_800 ? $0 : nil
+        $0.isFinite && $0 > now && $0 < maxTimestamp ? $0 : nil
       }
       guard used != nil || reset != nil else { return nil }
       return Candidate(used: used, capturedAt: record.capturedAt, source: .code, reset: reset)
@@ -277,13 +273,11 @@ public enum ClaudeQuota {
     -> ClaudeQuotaWindow?
   {
     let candidates = [desktop, code].compactMap { $0 }.filter { $0.used != nil }
-    let freshUsage = candidates.filter {
-      $0.capturedAt <= now && now - $0.capturedAt <= $0.source.maxAge
-    }
+    let freshUsage = candidates.filter { $0.isFresh(at: now, maxAge: $0.source.maxAge) }
     let usage = (freshUsage.isEmpty ? candidates : freshUsage)
       .max(by: { $0.capturedAt < $1.capturedAt })
     let reset = code.flatMap { candidate in
-      candidate.capturedAt <= now && now - candidate.capturedAt <= ClaudeQuotaSource.code.maxAge
+      candidate.isFresh(at: now, maxAge: ClaudeQuotaSource.code.maxAge)
         ? candidate.reset.map { (value: $0, capturedAt: candidate.capturedAt) } : nil
     }
     guard let usage else {

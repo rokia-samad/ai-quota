@@ -31,26 +31,9 @@ private enum ClaudeBridge {
     }
 
     static func installStatusLine() throws {
-        let settingsURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
-        let data: Data
-        if FileManager.default.fileExists(atPath: settingsURL.path) {
-            do { data = try Data(contentsOf: settingsURL) }
-            catch { throw NSError(domain: "ClaudeBridge", code: 3, userInfo: [NSLocalizedDescriptionKey: "Impossible de lire les réglages de Claude Code. Aucun réglage n’a été modifié."]) }
-        } else {
-            data = Data("{}".utf8)
-        }
-        guard var settings = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw NSError(domain: "ClaudeBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "Le fichier settings.json de Claude Code n’est pas un objet JSON valide."])
-        }
-        if settings["statusLine"] != nil {
-            throw NSError(domain: "ClaudeBridge", code: 2, userInfo: [NSLocalizedDescriptionKey: "Une ligne de statut Claude est déjà configurée. Consulte le README pour la relier au widget sans écraser ta configuration."])
-        }
-        let executable = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
-        let quoted = "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        settings["statusLine"] = ["type": "command", "command": "\(quoted) --claude-statusline", "refreshInterval": 60]
-        let updated = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
-        try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try updated.write(to: settingsURL, options: .atomic)
+        try ClaudeStatusLineInstaller.install(
+            settingsURL: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json"),
+            executablePath: Bundle.main.executableURL?.path ?? CommandLine.arguments[0])
     }
 
 }
@@ -223,7 +206,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
             await client.setRateLimitsChangedHandler { [weak self] data in
                 Task { @MainActor in
                     switch data {
-                    case .success(let reading): self?.updateCodex(reading)
+                    case .success(let update): self?.applyCodexUpdate(update)
                     case .failure(let error): self?.failCodex(error)
                     }
                 }
@@ -427,12 +410,19 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     }
 
     @objc private func enableClaude() {
+        // A menu item title would be overwritten by the next render, so report the outcome in an alert.
+        let alert = NSAlert()
         do {
             try ClaudeBridge.installStatusLine()
-            claudeItem.title = "Claude : activé. Envoie un message dans Claude Code pour recevoir les quotas."
+            alert.messageText = "Claude Code relié"
+            alert.informativeText = "Envoie un message dans Claude Code pour recevoir les quotas."
         } catch {
-            claudeItem.title = "Claude : \(error.localizedDescription)"
+            alert.alertStyle = .warning
+            alert.messageText = "Impossible de relier Claude Code"
+            alert.informativeText = error.localizedDescription
         }
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func refreshAsync() async {
@@ -445,6 +435,11 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         codexLimits = nil
         codexCapturedAt = nil
         render()
+    }
+
+    private func applyCodexUpdate(_ update: RateLimitResponse) {
+        guard let merged = (codexLimits ?? RateLimitResponse(rateLimits: nil)).applying(update) else { return }
+        updateCodex(merged)
     }
 
     private func updateCodex(_ data: RateLimitResponse) {
@@ -585,14 +580,13 @@ private final class QuotaController: NSObject, NSMenuDelegate {
             show(.claude, on: primaryStatusItem)
             secondaryStatusItem.isVisible = false
         }
-        let unavailable = "indisponible"
-        codexItem.title = "ChatGPT · 5 h \(codexFresh ? "\(codexSession.map { number($0.usedPercent) } ?? unavailable) \(label)" : unavailable) · 7 j \(codexFresh ? "\(codexWeek.map { number($0.usedPercent) } ?? unavailable) \(label)" : unavailable)"
+        func summary(_ used: Double?, fresh: Bool) -> String {
+            guard fresh, let used else { return "indisponible" }
+            return "\(number(used)) \(label)"
+        }
+        codexItem.title = "ChatGPT · 5 h \(summary(codexSession?.usedPercent, fresh: codexFresh)) · 7 j \(summary(codexWeek?.usedPercent, fresh: codexFresh))"
         if let claude {
-            func summary(_ window: ClaudeQuotaWindow?, fresh: Bool) -> String {
-                guard fresh, let used = window?.usedPercent else { return unavailable }
-                return "\(number(used)) \(label)"
-            }
-            claudeItem.title = "Claude · 5 h \(summary(claude.fiveHour, fresh: claudeFiveFresh)) · 7 j \(summary(claude.sevenDay, fresh: claudeSevenFresh))"
+            claudeItem.title = "Claude · 5 h \(summary(claude.fiveHour?.usedPercent, fresh: claudeFiveFresh)) · 7 j \(summary(claude.sevenDay?.usedPercent, fresh: claudeSevenFresh))"
         } else {
             claudeItem.title = claudeError.map { "Claude · \($0)" } ?? "Claude · en attente d’une première mesure"
         }
