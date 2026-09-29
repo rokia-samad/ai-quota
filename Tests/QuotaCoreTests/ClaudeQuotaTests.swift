@@ -99,7 +99,7 @@ private func claudeRead(
 }
 
 @Test func invalidResetDoesNotDiscardValidUsage() throws {
-  for reset in ["\"invalid\"", "-1", "1700000000", "true"] {
+  for reset in ["\"invalid\"", "-1", "1699999990", "true"] {
     let data = Data(
       "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":44,\"resets_at\":\(reset)}},\"captured_at\":1699999995}"
         .utf8
@@ -201,4 +201,49 @@ private func claudeRead(
     try ClaudeQuota.read(
       desktopURL: directory.appendingPathComponent("missing.json"), statusURL: cache, now: claudeNow
     ) == nil)
+}
+
+@Test func codeUsageIsNotCurrentOnceItsResetPassed() throws {
+  let status = Data(
+    #"{"rate_limits":{"five_hour":{"used_percentage":90,"resets_at":1700000100}},"captured_at":1699999995}"#
+      .utf8)
+  let before = try claudeRead(status: status, now: claudeNow + 50)!
+  #expect(before.fiveHour?.isFresh(at: claudeNow + 50) == true)
+  for now in [claudeNow + 100, claudeNow + 200] {
+    let after = try claudeRead(status: status, now: now)!
+    #expect(after.fiveHour?.usedPercent == 90)
+    #expect(after.fiveHour?.isFresh(at: now) == false)
+    #expect(after.fiveHour?.freshReset(at: now) == nil)
+  }
+}
+
+@Test func cachedReadingExpiresWhenResetPassesLater() throws {
+  let status = Data(
+    #"{"rate_limits":{"five_hour":{"used_percentage":90,"resets_at":1700000100}},"captured_at":1699999995}"#
+      .utf8)
+  let reading = try claudeRead(status: status)!
+  #expect(reading.fiveHour?.isFresh(at: claudeNow) == true)
+  #expect(reading.fiveHour?.isFresh(at: claudeNow + 100) == false)
+}
+
+@Test func desktopUsageIsCheckedAgainstCodeReset() throws {
+  // The Code measurement is older than its 15-minute freshness, yet its reset remains a fact.
+  let status = Data(
+    #"{"rate_limits":{"five_hour":{"used_percentage":70,"resets_at":1699999700}},"captured_at":1699998500}"#
+      .utf8)
+  let before = Data(#"{"samples":[{"t":1699999600000,"u":{"fh":80}}]}"#.utf8)
+  let stale = try claudeRead(desktop: before, status: status)!
+  #expect(stale.fiveHour?.source == .desktop)
+  #expect(stale.fiveHour?.isFresh(at: claudeNow) == false)
+
+  let after = Data(#"{"samples":[{"t":1699999800000,"u":{"fh":5}}]}"#.utf8)
+  let current = try claudeRead(desktop: after, status: status)!
+  #expect(current.fiveHour?.usedPercent == 5)
+  #expect(current.fiveHour?.isFresh(at: claudeNow) == true)
+}
+
+@Test func expiredResetOnlyWindowIsDropped() throws {
+  let status = Data(
+    #"{"rate_limits":{"five_hour":{"resets_at":1699999998}},"captured_at":1699999995}"#.utf8)
+  #expect(try claudeRead(status: status) == nil)
 }

@@ -17,11 +17,19 @@ public struct ClaudeQuotaWindow: Sendable {
   public let usedPercent: Double?
   public let capturedAt: TimeInterval
   public let source: ClaudeQuotaSource
+  /// Latest reset reported by Claude Code for this window, kept once passed so that usage
+  /// measured before it can be recognized as belonging to the previous window.
   public let resetsAt: TimeInterval?
   public let resetCapturedAt: TimeInterval?
 
   public func isFresh(at now: TimeInterval) -> Bool {
-    now >= capturedAt && now - capturedAt <= source.maxAge
+    now >= capturedAt && now - capturedAt <= source.maxAge && !predatesReset(at: now)
+  }
+
+  /// The window was reset after this usage was measured: it no longer describes the current one.
+  public func predatesReset(at now: TimeInterval) -> Bool {
+    guard let resetsAt else { return false }
+    return capturedAt < resetsAt && resetsAt <= now
   }
 
   public func freshReset(at now: TimeInterval) -> TimeInterval? {
@@ -213,10 +221,6 @@ public enum ClaudeQuota {
     let capturedAt: Double
     let source: ClaudeQuotaSource
     let reset: Double?
-
-    func isFresh(at now: Double, maxAge: TimeInterval) -> Bool {
-      capturedAt <= now && now - capturedAt <= maxAge
-    }
   }
 
   private struct Parsed {
@@ -241,7 +245,7 @@ public enum ClaudeQuota {
       guard let window else { return nil }
       let used = window.usedPercentage.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
       let reset = window.resetsAt.flatMap {
-        $0.isFinite && $0 > now && $0 < maxTimestamp ? $0 : nil
+        $0.isFinite && $0 > record.capturedAt && $0 < maxTimestamp ? $0 : nil
       }
       guard used != nil || reset != nil else { return nil }
       return Candidate(used: used, capturedAt: record.capturedAt, source: .code, reset: reset)
@@ -272,23 +276,24 @@ public enum ClaudeQuota {
   private static func combine(_ desktop: Candidate?, _ code: Candidate?, now: Double)
     -> ClaudeQuotaWindow?
   {
-    let candidates = [desktop, code].compactMap { $0 }.filter { $0.used != nil }
-    let freshUsage = candidates.filter { $0.isFresh(at: now, maxAge: $0.source.maxAge) }
-    let usage = (freshUsage.isEmpty ? candidates : freshUsage)
+    // Only Claude Code reports resets; Desktop usage is checked against them too.
+    let reset = code.flatMap { code in code.reset.map { (value: $0, capturedAt: code.capturedAt) } }
+    let windows = [desktop, code].compactMap { $0 }.filter { $0.used != nil }.map {
+      ClaudeQuotaWindow(
+        usedPercent: $0.used, capturedAt: $0.capturedAt, source: $0.source,
+        resetsAt: reset?.value, resetCapturedAt: reset?.capturedAt)
+    }
+    let freshWindows = windows.filter { $0.isFresh(at: now) }
+    if let usage = (freshWindows.isEmpty ? windows : freshWindows)
       .max(by: { $0.capturedAt < $1.capturedAt })
-    let reset = code.flatMap { candidate in
-      candidate.isFresh(at: now, maxAge: ClaudeQuotaSource.code.maxAge)
-        ? candidate.reset.map { (value: $0, capturedAt: candidate.capturedAt) } : nil
+    {
+      return usage
     }
-    guard let usage else {
-      guard let reset else { return nil }
-      return ClaudeQuotaWindow(
-        usedPercent: nil, capturedAt: reset.capturedAt, source: .code,
-        resetsAt: reset.value, resetCapturedAt: reset.capturedAt)
-    }
-    return ClaudeQuotaWindow(
-      usedPercent: usage.used, capturedAt: usage.capturedAt, source: usage.source,
-      resetsAt: reset?.value, resetCapturedAt: reset?.capturedAt)
+    guard let reset else { return nil }
+    let resetOnly = ClaudeQuotaWindow(
+      usedPercent: nil, capturedAt: reset.capturedAt, source: .code,
+      resetsAt: reset.value, resetCapturedAt: reset.capturedAt)
+    return resetOnly.freshReset(at: now) == nil ? nil : resetOnly
   }
 
   private static func saveStatus(

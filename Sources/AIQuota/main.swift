@@ -62,6 +62,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private var refreshTimer: Timer?
     private var cycleTimer: Timer?
     private var codexError: String?
+    private var claude: ClaudeQuotaReading?
     private var claudeError: String?
     private var codexLimits: RateLimitResponse?
     private var codexCapturedAt: TimeInterval?
@@ -85,6 +86,8 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private var currentProvider: Provider = .codex
     private lazy var codexIcon = providerIcon(.codex)
     private lazy var claudeIcon = providerIcon(.claude)
+    /// Options showing a checkmark, each with the rule deciding its state.
+    private var checkableItems: [(item: NSMenuItem, isOn: @MainActor () -> Bool)] = []
 
     private func providerIcon(_ provider: Provider) -> NSImage? {
         let path = provider == .codex
@@ -131,65 +134,50 @@ private final class QuotaController: NSObject, NSMenuDelegate {
             heading.isEnabled = false
             displayMenu.addItem(heading)
         }
-        func addDisplayOption(_ title: String, _ selector: Selector) {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-            item.target = self
-            displayMenu.addItem(item)
-        }
         addDisplayHeading("Pourcentage")
-        addDisplayOption("Disponible", #selector(showAvailable))
-        addDisplayOption("Utilisé", #selector(showUsed))
+        addOption("Disponible", #selector(showAvailable), to: displayMenu) { [unowned self] in displayMode == .available }
+        addOption("Utilisé", #selector(showUsed), to: displayMenu) { [unowned self] in displayMode == .used }
         displayMenu.addItem(.separator())
         addDisplayHeading("Services")
-        addDisplayOption("Défilement automatique", #selector(showAlternating))
-        addDisplayOption("ChatGPT et Claude côte à côte", #selector(showBothProviders))
-        addDisplayOption("ChatGPT seulement", #selector(showCodexOnly))
-        addDisplayOption("Claude seulement", #selector(showClaudeOnly))
+        addOption("Défilement automatique", #selector(showAlternating), to: displayMenu) { [unowned self] in providerMode == .alternating }
+        addOption("ChatGPT et Claude côte à côte", #selector(showBothProviders), to: displayMenu) { [unowned self] in providerMode == .both }
+        addOption("ChatGPT seulement", #selector(showCodexOnly), to: displayMenu) { [unowned self] in providerMode == .codex }
+        addOption("Claude seulement", #selector(showClaudeOnly), to: displayMenu) { [unowned self] in providerMode == .claude }
         displayMenu.addItem(.separator())
         addDisplayHeading("Fenêtres de quota")
-        addDisplayOption("5 h et 7 j", #selector(showBothWindows))
-        addDisplayOption("5 h seulement", #selector(showSessionOnly))
-        addDisplayOption("7 j seulement", #selector(showWeeklyOnly))
+        addOption("5 h et 7 j", #selector(showBothWindows), to: displayMenu) { [unowned self] in windowMode == .both }
+        addOption("5 h seulement", #selector(showSessionOnly), to: displayMenu) { [unowned self] in windowMode == .session }
+        addOption("7 j seulement", #selector(showWeeklyOnly), to: displayMenu) { [unowned self] in windowMode == .weekly }
         displayMenu.addItem(.separator())
         addDisplayHeading("Défilement")
         displayMenu.addItem(countdownItem)
-        addDisplayOption("Toutes les 5 secondes", #selector(cycleEvery5))
-        addDisplayOption("Toutes les 10 secondes", #selector(cycleEvery10))
-        addDisplayOption("Toutes les 20 secondes", #selector(cycleEvery20))
-        addDisplayOption("Durée personnalisée…", #selector(customizeCycle))
-        addDisplayOption("Afficher le compte à rebours", #selector(toggleCountdown))
+        addOption("Toutes les 5 secondes", #selector(cycleEvery5), to: displayMenu) { [unowned self] in cycleSeconds == 5 }
+        addOption("Toutes les 10 secondes", #selector(cycleEvery10), to: displayMenu) { [unowned self] in cycleSeconds == 10 }
+        addOption("Toutes les 20 secondes", #selector(cycleEvery20), to: displayMenu) { [unowned self] in cycleSeconds == 20 }
+        addOption("Durée personnalisée…", #selector(customizeCycle), to: displayMenu) { [unowned self] in ![5, 10, 20].contains(cycleSeconds) }
+        addOption("Afficher le compte à rebours", #selector(toggleCountdown), to: displayMenu) { [unowned self] in showCountdown }
         menu.setSubmenu(displayMenu, for: menu.addItem(withTitle: "Affichage", action: nil, keyEquivalent: ""))
 
         let refreshMenu = NSMenu()
-        for (title, selector) in [
-            ("Activée", #selector(toggleAutoRefresh)),
-            ("Toutes les 30 secondes", #selector(refreshEvery30)),
-            ("Toutes les 1 minute", #selector(refreshEvery60)),
-            ("Toutes les 5 minutes", #selector(refreshEvery300))
-        ] {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-            item.target = self
-            refreshMenu.addItem(item)
-        }
+        addOption("Activée", #selector(toggleAutoRefresh), to: refreshMenu) { [unowned self] in refreshEnabled }
+        addOption("Toutes les 30 secondes", #selector(refreshEvery30), to: refreshMenu) { [unowned self] in refreshSeconds == 30 }
+        addOption("Toutes les 1 minute", #selector(refreshEvery60), to: refreshMenu) { [unowned self] in refreshSeconds == 60 }
+        addOption("Toutes les 5 minutes", #selector(refreshEvery300), to: refreshMenu) { [unowned self] in refreshSeconds == 300 }
         menu.setSubmenu(refreshMenu, for: menu.addItem(withTitle: "Actualisation", action: nil, keyEquivalent: ""))
 
         let alertsMenu = NSMenu()
         alertsMenu.addItem(alertThresholdItem)
         alertsMenu.addItem(.separator())
-        for (title, selector) in [
-            ("Désactivées", #selector(disableAlerts)),
-            ("Sous 10 % disponibles", #selector(alertBelow10)),
-            ("Sous 20 % disponibles", #selector(alertBelow20)),
-            ("Sous 30 % disponibles", #selector(alertBelow30))
-        ] {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-            item.target = self
-            alertsMenu.addItem(item)
+        addOption("Désactivées", #selector(disableAlerts), to: alertsMenu) { [unowned self] in alertThreshold == 0 }
+        addOption("Sous 10 % disponibles", #selector(alertBelow10), to: alertsMenu) { [unowned self] in alertThreshold == 10 }
+        addOption("Sous 20 % disponibles", #selector(alertBelow20), to: alertsMenu) { [unowned self] in alertThreshold == 20 }
+        addOption("Sous 30 % disponibles", #selector(alertBelow30), to: alertsMenu) { [unowned self] in alertThreshold == 30 }
+        addOption("Seuil personnalisé…", #selector(customizeAlertThreshold), to: alertsMenu) { [unowned self] in
+            alertThreshold > 0 && ![10, 20, 30].contains(alertThreshold)
         }
-        alertsMenu.addItem(withTitle: "Seuil personnalisé…", action: #selector(customizeAlertThreshold), keyEquivalent: "").target = self
         menu.setSubmenu(alertsMenu, for: menu.addItem(withTitle: "Alertes de quota", action: nil, keyEquivalent: ""))
 
-        menu.addItem(withTitle: "Lancer à l’ouverture de session", action: #selector(toggleLaunchAtLogin), keyEquivalent: "").target = self
+        addOption("Lancer à l’ouverture de session", #selector(toggleLaunchAtLogin), to: menu) { SMAppService.mainApp.status == .enabled }
         menu.addItem(.separator())
         menu.addItem(withTitle: "Relier Claude Code", action: #selector(enableClaude), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Actualiser maintenant", action: #selector(refresh), keyEquivalent: "r").target = self
@@ -199,6 +187,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         secondaryStatusItem.menu = menu
         primaryStatusItem.button?.imagePosition = .imageLeading
         secondaryStatusItem.button?.imagePosition = .imageLeading
+        reloadClaude()
         render()
         if alertThreshold > 0 { requestAlertAuthorization() }
         Task { [weak self] in
@@ -217,12 +206,37 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         startCycleTimer()
     }
 
+    private func addOption(_ title: String, _ selector: Selector, to menu: NSMenu, isOn: @escaping @MainActor () -> Bool) {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        checkableItems.append((item, isOn))
+    }
+
     @objc private func refresh() {
+        reloadClaude()
         render()
         Task { await refreshAsync() }
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) { render() }
+    /// Opening the menu picks up a newer Claude measurement; menu-only states are updated here too.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        reloadClaude()
+        for (item, isOn) in checkableItems { item.state = isOn() ? .on : .off }
+        alertThresholdItem.title = alertThreshold > 0 ? "Seuil actuel : \(alertThreshold) % disponibles" : "Seuil actuel : désactivé"
+        render()
+    }
+
+    /// The only place reading Claude's files: renders (countdown, display changes) use this cached reading.
+    private func reloadClaude() {
+        do {
+            claude = try ClaudeBridge.read()
+            claudeError = nil
+        } catch {
+            claude = nil
+            claudeError = error.localizedDescription
+        }
+    }
 
     @objc private func toggleLaunchAtLogin() {
         do {
@@ -437,9 +451,16 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         render()
     }
 
+    /// Notifications are sparse: merge them only into a reading still current, so that an old
+    /// window they omit is not re-stamped as fresh.
     private func applyCodexUpdate(_ update: RateLimitResponse) {
-        guard let merged = (codexLimits ?? RateLimitResponse(rateLimits: nil)).applying(update) else { return }
+        let current = isCodexFresh(at: Date().timeIntervalSince1970) ? codexLimits : nil
+        guard let merged = (current ?? RateLimitResponse(rateLimits: nil)).applying(update) else { return }
         updateCodex(merged)
+    }
+
+    private func isCodexFresh(at now: TimeInterval) -> Bool {
+        codexError == nil && (codexCapturedAt.map { now - $0 <= max(300, TimeInterval(refreshSeconds * 2)) } ?? false)
     }
 
     private func updateCodex(_ data: RateLimitResponse) {
@@ -453,46 +474,9 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         let codexSession = codexLimits?.rateLimits?.primary
         let codexWeek = codexLimits?.rateLimits?.secondary
         let now = Date().timeIntervalSince1970
-        let claude: ClaudeQuotaReading?
-        do {
-            claude = try ClaudeBridge.read()
-            claudeError = nil
-        } catch {
-            claude = nil
-            claudeError = error.localizedDescription
-        }
         let label = displayMode == .available ? "disponible" : "utilisé"
 
-        let displayMenu = menu.item(withTitle: "Affichage")?.submenu
-        displayMenu?.item(withTitle: "Disponible")?.state = displayMode == .available ? .on : .off
-        displayMenu?.item(withTitle: "Utilisé")?.state = displayMode == .used ? .on : .off
-        displayMenu?.item(withTitle: "Défilement automatique")?.state = providerMode == .alternating ? .on : .off
-        displayMenu?.item(withTitle: "ChatGPT et Claude côte à côte")?.state = providerMode == .both ? .on : .off
-        displayMenu?.item(withTitle: "ChatGPT seulement")?.state = providerMode == .codex ? .on : .off
-        displayMenu?.item(withTitle: "Claude seulement")?.state = providerMode == .claude ? .on : .off
-        displayMenu?.item(withTitle: "5 h et 7 j")?.state = windowMode == .both ? .on : .off
-        displayMenu?.item(withTitle: "5 h seulement")?.state = windowMode == .session ? .on : .off
-        displayMenu?.item(withTitle: "7 j seulement")?.state = windowMode == .weekly ? .on : .off
-        displayMenu?.item(withTitle: "Toutes les 5 secondes")?.state = cycleSeconds == 5 ? .on : .off
-        displayMenu?.item(withTitle: "Toutes les 10 secondes")?.state = cycleSeconds == 10 ? .on : .off
-        displayMenu?.item(withTitle: "Toutes les 20 secondes")?.state = cycleSeconds == 20 ? .on : .off
-        displayMenu?.item(withTitle: "Durée personnalisée…")?.state = [5, 10, 20].contains(cycleSeconds) ? .off : .on
-        displayMenu?.item(withTitle: "Afficher le compte à rebours")?.state = showCountdown ? .on : .off
-        let refreshMenu = menu.item(withTitle: "Actualisation")?.submenu
-        refreshMenu?.item(withTitle: "Activée")?.state = refreshEnabled ? .on : .off
-        refreshMenu?.item(withTitle: "Toutes les 30 secondes")?.state = refreshSeconds == 30 ? .on : .off
-        refreshMenu?.item(withTitle: "Toutes les 1 minute")?.state = refreshSeconds == 60 ? .on : .off
-        refreshMenu?.item(withTitle: "Toutes les 5 minutes")?.state = refreshSeconds == 300 ? .on : .off
-        menu.item(withTitle: "Lancer à l’ouverture de session")?.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        let alertsMenu = menu.item(withTitle: "Alertes de quota")?.submenu
-        alertsMenu?.item(withTitle: "Désactivées")?.state = alertThreshold == 0 ? .on : .off
-        alertsMenu?.item(withTitle: "Sous 10 % disponibles")?.state = alertThreshold == 10 ? .on : .off
-        alertsMenu?.item(withTitle: "Sous 20 % disponibles")?.state = alertThreshold == 20 ? .on : .off
-        alertsMenu?.item(withTitle: "Sous 30 % disponibles")?.state = alertThreshold == 30 ? .on : .off
-        alertsMenu?.item(withTitle: "Seuil personnalisé…")?.state = alertThreshold > 0 && ![10, 20, 30].contains(alertThreshold) ? .on : .off
-        alertThresholdItem.title = alertThreshold > 0 ? "Seuil actuel : \(alertThreshold) % disponibles" : "Seuil actuel : désactivé"
-
-        let codexFresh = codexError == nil && (codexCapturedAt.map { now - $0 <= max(300, TimeInterval(refreshSeconds * 2)) } ?? false)
+        let codexFresh = isCodexFresh(at: now)
         let claudeFiveFresh = claude?.fiveHour?.isFresh(at: now) ?? false
         let claudeSevenFresh = claude?.sevenDay?.isFresh(at: now) ?? false
         let claudeFiveHasFreshReset = claude?.fiveHour?.freshReset(at: now) != nil
