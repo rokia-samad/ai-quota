@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-import json, sys, time
+import json, os, sys, time
 mode = sys.argv[0].split('/')[-1]
 initialized = False
 for line in sys.stdin:
@@ -9,12 +9,25 @@ for line in sys.stdin:
         if mode == 'silent':
             time.sleep(5)
             continue
+        if mode == 'closed-stdin':
+            # Stop reading before answering: every later client write hits a broken pipe.
+            os.close(0)
+            print(json.dumps({'id':message['id'],'result':{}}),flush=True)
+            time.sleep(3)
+            break
         time.sleep(.05)
         response = {}
     elif method == 'initialized':
         initialized = True
         continue
     elif method == 'account/rateLimits/read':
+        if mode == 'server-request':
+            # Server-initiated request reusing the client's id, which must not be taken as the response.
+            print(json.dumps({'id':message['id'],'method':'item/tool/requestUserInput','params':{}}),flush=True)
+            reply = json.loads(sys.stdin.readline())
+            if reply.get('id') != message['id'] or reply.get('error', {}).get('code') != -32601:
+                print(json.dumps({'id':message['id'],'error':{'code':-32099}}),flush=True)
+                continue
         if mode == 'error':
             print(json.dumps({'id':message['id'],'error':{'code':-32001,'message':'secret-like upstream detail'}}),flush=True)
             continue
