@@ -89,6 +89,38 @@ public struct RateLimitResponse: Decodable, Sendable {
   }
 }
 
+/// A Codex reading with the time it was received.
+public struct CodexMeasurement: Sendable {
+  public let reading: RateLimitResponse
+  public let capturedAt: TimeInterval
+
+  public init(reading: RateLimitResponse, capturedAt: TimeInterval) {
+    self.reading = reading
+    self.capturedAt = capturedAt
+  }
+
+  /// Current for 5 minutes, or two refresh intervals when that is longer.
+  public func isFresh(at now: TimeInterval, refreshInterval: TimeInterval) -> Bool {
+    now - capturedAt <= max(300, refreshInterval * 2)
+  }
+
+  /// Applies a sparse `account/rateLimits/updated` notification received at `now`. It only
+  /// completes a reading still current, so an old window it omits is never re-stamped as fresh.
+  /// Returns nil when the notification carries nothing for the `codex` bucket.
+  public static func applying(
+    _ update: RateLimitResponse, to current: CodexMeasurement?, at now: TimeInterval,
+    refreshInterval: TimeInterval
+  ) -> CodexMeasurement? {
+    let base = current.flatMap {
+      $0.isFresh(at: now, refreshInterval: refreshInterval) ? $0.reading : nil
+    }
+    guard let merged = (base ?? RateLimitResponse(rateLimits: nil)).applying(update) else {
+      return nil
+    }
+    return CodexMeasurement(reading: merged, capturedAt: now)
+  }
+}
+
 public enum CodexExecutable {
   public static let candidates = [
     "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",

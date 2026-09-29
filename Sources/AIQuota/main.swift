@@ -64,8 +64,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
     private var codexError: String?
     private var claude: ClaudeQuotaReading?
     private var claudeError: String?
-    private var codexLimits: RateLimitResponse?
-    private var codexCapturedAt: TimeInterval?
+    private var codex: CodexMeasurement?
     private var alertThreshold = UserDefaults.standard.integer(forKey: "quotaAlertThreshold")
     private var alertsAuthorized = false
     private var alertedWindows = Set<String>()
@@ -446,33 +445,33 @@ private final class QuotaController: NSObject, NSMenuDelegate {
 
     private func failCodex(_ error: any Error) {
         codexError = error.localizedDescription
-        codexLimits = nil
-        codexCapturedAt = nil
+        codex = nil
         render()
     }
 
-    /// Notifications are sparse: merge them only into a reading still current, so that an old
-    /// window they omit is not re-stamped as fresh.
     private func applyCodexUpdate(_ update: RateLimitResponse) {
-        let current = isCodexFresh(at: Date().timeIntervalSince1970) ? codexLimits : nil
-        guard let merged = (current ?? RateLimitResponse(rateLimits: nil)).applying(update) else { return }
-        updateCodex(merged)
+        let current = codexError == nil ? codex : nil
+        guard let merged = CodexMeasurement.applying(
+            update, to: current, at: Date().timeIntervalSince1970, refreshInterval: TimeInterval(refreshSeconds))
+        else { return }
+        codexError = nil
+        codex = merged
+        render()
     }
 
     private func isCodexFresh(at now: TimeInterval) -> Bool {
-        codexError == nil && (codexCapturedAt.map { now - $0 <= max(300, TimeInterval(refreshSeconds * 2)) } ?? false)
+        codexError == nil && (codex?.isFresh(at: now, refreshInterval: TimeInterval(refreshSeconds)) ?? false)
     }
 
     private func updateCodex(_ data: RateLimitResponse) {
         codexError = nil
-        codexLimits = data
-        codexCapturedAt = Date().timeIntervalSince1970
+        codex = CodexMeasurement(reading: data, capturedAt: Date().timeIntervalSince1970)
         render()
     }
 
     private func render() {
-        let codexSession = codexLimits?.rateLimits?.primary
-        let codexWeek = codexLimits?.rateLimits?.secondary
+        let codexSession = codex?.reading.rateLimits?.primary
+        let codexWeek = codex?.reading.rateLimits?.secondary
         let now = Date().timeIntervalSince1970
         let label = displayMode == .available ? "disponible" : "utilisé"
 
@@ -483,7 +482,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
         let claudeSevenHasFreshReset = claude?.sevenDay?.freshReset(at: now) != nil
         let claudeMeasurement = claude?.latestMeasurement
         let claudeFresh = claudeFiveFresh || claudeSevenFresh
-        codexAgeItem.title = "ChatGPT · dernière mesure : \(ageText(codexCapturedAt, now: now))\(codexFresh ? "" : " · ancienne")"
+        codexAgeItem.title = "ChatGPT · dernière mesure : \(ageText(codex?.capturedAt, now: now))\(codexFresh ? "" : " · ancienne")"
         if let claudeMeasurement {
             claudeAgeItem.title = "Claude · \(claudeMeasurement.source.rawValue) · mesure \(claudeFresh ? "" : "ancienne · ")\(ageText(claudeMeasurement.capturedAt, now: now))"
         } else {
@@ -518,7 +517,7 @@ private final class QuotaController: NSObject, NSMenuDelegate {
             case .weekly: title = "7 j \(weeklyText)"
             }
             let name = provider == .codex ? "ChatGPT" : "Claude"
-            let capturedAt = provider == .codex ? codexCapturedAt : claude?.latestMeasurement?.capturedAt
+            let capturedAt = provider == .codex ? codex?.capturedAt : claude?.latestMeasurement?.capturedAt
             var redRanges: [NSRange] = []
             for (prefix, text, used, visible) in [
                 ("5 h ", sessionText, sessionUsed, windowMode != .weekly && sessionValid),

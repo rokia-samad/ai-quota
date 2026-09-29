@@ -20,7 +20,10 @@ public struct ClaudeQuotaWindow: Sendable {
   /// Latest reset reported by Claude Code for this window, kept once passed so that usage
   /// measured before it can be recognized as belonging to the previous window.
   public let resetsAt: TimeInterval?
+  /// When Claude Code reported `resetsAt`, which may precede the usage measurement.
   public let resetCapturedAt: TimeInterval?
+  /// An earlier reset that had already happened when `resetsAt` replaced it.
+  public let previousResetAt: TimeInterval?
 
   public func isFresh(at now: TimeInterval) -> Bool {
     now >= capturedAt && now - capturedAt <= source.maxAge && !predatesReset(at: now)
@@ -28,8 +31,9 @@ public struct ClaudeQuotaWindow: Sendable {
 
   /// The window was reset after this usage was measured: it no longer describes the current one.
   public func predatesReset(at now: TimeInterval) -> Bool {
-    guard let resetsAt else { return false }
-    return capturedAt < resetsAt && resetsAt <= now
+    [resetsAt, previousResetAt].contains { reset in
+      reset.map { capturedAt < $0 && $0 <= now } ?? false
+    }
   }
 
   public func freshReset(at now: TimeInterval) -> TimeInterval? {
@@ -90,24 +94,58 @@ public enum ClaudeQuota {
     }
   }
 
+  /// Cached window. Usage is always from the record's `captured_at`; resets may be carried over
+  /// from earlier status lines, so they keep their own observation time.
   private struct StatusLimit: Codable {
     let usedPercentage: Double?
     let resetsAt: Double?
+    /// Absent in caches written before resets were carried over: the record's `captured_at`.
+    let resetCapturedAt: Double?
+    let previousResetAt: Double?
 
     enum CodingKeys: String, CodingKey {
       case usedPercentage = "used_percentage"
       case resetsAt = "resets_at"
+      case resetCapturedAt = "reset_captured_at"
+      case previousResetAt = "previous_resets_at"
     }
 
-    init(usedPercentage: Double?, resetsAt: Double?) {
+    init(
+      usedPercentage: Double?, resetsAt: Double?, resetCapturedAt: Double?, previousResetAt: Double?
+    ) {
       self.usedPercentage = usedPercentage
       self.resetsAt = resetsAt
+      self.resetCapturedAt = resetCapturedAt
+      self.previousResetAt = previousResetAt
     }
 
     init(from decoder: any Decoder) throws {
       let container = try decoder.container(keyedBy: CodingKeys.self)
       usedPercentage = try? container.decode(Double.self, forKey: .usedPercentage)
       resetsAt = try? container.decode(Double.self, forKey: .resetsAt)
+      resetCapturedAt = try? container.decode(Double.self, forKey: .resetCapturedAt)
+      previousResetAt = try? container.decode(Double.self, forKey: .previousResetAt)
+    }
+  }
+
+  /// Resets known for a window, validated against the time they were observed.
+  private struct KnownResets {
+    let resetsAt: Double?
+    let capturedAt: Double
+    let previous: Double?
+
+    init?(_ limit: StatusLimit?, recordCapturedAt: Double) {
+      guard let limit else { return nil }
+      let observed = limit.resetCapturedAt ?? recordCapturedAt
+      guard observed.isFinite, observed > 0, observed <= recordCapturedAt else { return nil }
+      resetsAt = limit.resetsAt.flatMap {
+        $0.isFinite && $0 > observed && $0 < maxTimestamp ? $0 : nil
+      }
+      previous = limit.previousResetAt.flatMap {
+        $0.isFinite && $0 > 0 && $0 <= observed ? $0 : nil
+      }
+      capturedAt = observed
+      if resetsAt == nil && previous == nil { return nil }
     }
   }
 
@@ -139,42 +177,66 @@ public enum ClaudeQuota {
   }
 
   /// Consumes Claude Code's documented status-line JSON and saves only quota data.
+  ///
+  /// Usage comes only from this status line. Resets reported earlier are carried over, because a
+  /// reset that already happened still dates older usage (Desktop's in particular).
   @discardableResult
   public static func captureStatusLine(
     input: Data, cacheURL: URL, capturedAt: TimeInterval = Date().timeIntervalSince1970
   ) throws -> String {
-    guard capturedAt.isFinite, capturedAt > 0,
-      let object = try? JSONSerialization.jsonObject(with: input) as? [String: Any]
-    else {
-      try saveStatus(rateLimits: nil, error: "invalid", capturedAt: capturedAt, to: cacheURL)
-      return "Claude · données invalides"
-    }
-
-    guard let limitsValue = object["rate_limits"] else {
-      try saveStatus(rateLimits: nil, error: nil, capturedAt: capturedAt, to: cacheURL)
-      return "Claude · quotas en attente"
-    }
-    guard let rawLimits = limitsValue as? [String: Any] else {
-      try saveStatus(rateLimits: nil, error: "invalid", capturedAt: capturedAt, to: cacheURL)
-      return "Claude · données invalides"
-    }
-
-    func window(_ key: String) -> StatusLimit? {
-      guard let raw = rawLimits[key] as? [String: Any] else { return nil }
-      let percentage = jsonNumber(raw["used_percentage"])
-      let validPercentage = percentage.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
-      let reset = jsonNumber(raw["resets_at"])
-      let validReset = reset.flatMap {
-        $0.isFinite && $0 > capturedAt && $0 < maxTimestamp ? $0 : nil
+    let date = capturedAt.isFinite && capturedAt > 0 ? capturedAt : Date().timeIntervalSince1970
+    var rawLimits: [String: Any] = [:]
+    var error: String? = "invalid"
+    if capturedAt.isFinite, capturedAt > 0,
+      let object = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
+    {
+      switch object["rate_limits"] {
+      case nil: error = nil
+      case let limits as [String: Any]:
+        rawLimits = limits
+        error = nil
+      default: break
       }
-      guard validPercentage != nil || validReset != nil else { return nil }
-      return StatusLimit(usedPercentage: validPercentage, resetsAt: validReset)
     }
 
-    let limits = StatusLimits(fiveHour: window("five_hour"), sevenDay: window("seven_day"))
-    try saveStatus(rateLimits: limits, error: nil, capturedAt: capturedAt, to: cacheURL)
-    return limits.fiveHour == nil && limits.sevenDay == nil
-      ? "Claude · quotas en attente" : "Claude"
+    let previous = (try? Data(contentsOf: cacheURL))
+      .flatMap { try? JSONDecoder().decode(StatusRecord.self, from: $0) }
+    var observed = false
+    func window(_ key: String, previous old: StatusLimit?) -> StatusLimit? {
+      let raw = rawLimits[key] as? [String: Any]
+      let used = jsonNumber(raw?["used_percentage"])
+        .flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
+      let reset = jsonNumber(raw?["resets_at"])
+        .flatMap { $0.isFinite && $0 > date && $0 < maxTimestamp ? $0 : nil }
+      if used != nil || reset != nil { observed = true }
+
+      let known = previous.flatMap { KnownResets(old, recordCapturedAt: $0.capturedAt) }
+      var resetsAt = known?.resetsAt
+      var resetCapturedAt = known?.capturedAt
+      var previousReset = known?.previous
+      if let reset {
+        // A superseded reset that already happened remains a fact about older usage.
+        if let passed = resetsAt, passed <= date, passed != reset {
+          previousReset = max(previousReset ?? passed, passed)
+        }
+        resetsAt = reset
+        resetCapturedAt = date
+      }
+      guard used != nil || resetsAt != nil || previousReset != nil else { return nil }
+      return StatusLimit(
+        usedPercentage: used, resetsAt: resetsAt, resetCapturedAt: resetCapturedAt,
+        previousResetAt: previousReset)
+    }
+
+    let fiveHour = window("five_hour", previous: previous?.rateLimits?.fiveHour)
+    let sevenDay = window("seven_day", previous: previous?.rateLimits?.sevenDay)
+    let limits =
+      fiveHour == nil && sevenDay == nil
+      ? nil : StatusLimits(fiveHour: fiveHour, sevenDay: sevenDay)
+    try saveStatus(
+      StatusRecord(rateLimits: limits, capturedAt: date, captureError: error), to: cacheURL)
+    if error != nil { return "Claude · données invalides" }
+    return observed ? "Claude" : "Claude · quotas en attente"
   }
 
   public static func read(
@@ -220,7 +282,7 @@ public enum ClaudeQuota {
     let used: Double?
     let capturedAt: Double
     let source: ClaudeQuotaSource
-    let reset: Double?
+    var resets: KnownResets? = nil
   }
 
   private struct Parsed {
@@ -244,11 +306,9 @@ public enum ClaudeQuota {
     func candidate(_ window: StatusLimit?) -> Candidate? {
       guard let window else { return nil }
       let used = window.usedPercentage.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
-      let reset = window.resetsAt.flatMap {
-        $0.isFinite && $0 > record.capturedAt && $0 < maxTimestamp ? $0 : nil
-      }
-      guard used != nil || reset != nil else { return nil }
-      return Candidate(used: used, capturedAt: record.capturedAt, source: .code, reset: reset)
+      let resets = KnownResets(window, recordCapturedAt: record.capturedAt)
+      guard used != nil || resets != nil else { return nil }
+      return Candidate(used: used, capturedAt: record.capturedAt, source: .code, resets: resets)
     }
     return Parsed(
       fiveHour: candidate(limits.fiveHour), sevenDay: candidate(limits.sevenDay),
@@ -266,7 +326,7 @@ public enum ClaudeQuota {
     }
     func candidate(_ value: Double?) -> Candidate? {
       guard let value, value.isFinite, (0...100).contains(value) else { return nil }
-      return Candidate(used: value, capturedAt: capturedAt, source: .desktop, reset: nil)
+      return Candidate(used: value, capturedAt: capturedAt, source: .desktop)
     }
     return Parsed(
       fiveHour: candidate(sample.usage.fiveHour), sevenDay: candidate(sample.usage.sevenDay),
@@ -277,11 +337,13 @@ public enum ClaudeQuota {
     -> ClaudeQuotaWindow?
   {
     // Only Claude Code reports resets; Desktop usage is checked against them too.
-    let reset = code.flatMap { code in code.reset.map { (value: $0, capturedAt: code.capturedAt) } }
+    let resets = code?.resets
+    let resetCapturedAt = resets?.resetsAt == nil ? nil : resets?.capturedAt
     let windows = [desktop, code].compactMap { $0 }.filter { $0.used != nil }.map {
       ClaudeQuotaWindow(
         usedPercent: $0.used, capturedAt: $0.capturedAt, source: $0.source,
-        resetsAt: reset?.value, resetCapturedAt: reset?.capturedAt)
+        resetsAt: resets?.resetsAt, resetCapturedAt: resetCapturedAt,
+        previousResetAt: resets?.previous)
     }
     let freshWindows = windows.filter { $0.isFresh(at: now) }
     if let usage = (freshWindows.isEmpty ? windows : freshWindows)
@@ -289,18 +351,18 @@ public enum ClaudeQuota {
     {
       return usage
     }
-    guard let reset else { return nil }
+    // A reset alone is shown only when the latest status line reported it; one carried over from
+    // an earlier line only dates usage, so that line's "no quota" state stays visible.
+    guard let resets, let reset = resets.resetsAt, resets.capturedAt == code?.capturedAt else {
+      return nil
+    }
     let resetOnly = ClaudeQuotaWindow(
-      usedPercent: nil, capturedAt: reset.capturedAt, source: .code,
-      resetsAt: reset.value, resetCapturedAt: reset.capturedAt)
+      usedPercent: nil, capturedAt: resets.capturedAt, source: .code,
+      resetsAt: reset, resetCapturedAt: resets.capturedAt, previousResetAt: resets.previous)
     return resetOnly.freshReset(at: now) == nil ? nil : resetOnly
   }
 
-  private static func saveStatus(
-    rateLimits: StatusLimits?, error: String?, capturedAt: Double, to url: URL
-  ) throws {
-    let date = capturedAt.isFinite && capturedAt > 0 ? capturedAt : Date().timeIntervalSince1970
-    let record = StatusRecord(rateLimits: rateLimits, capturedAt: date, captureError: error)
+  private static func saveStatus(_ record: StatusRecord, to url: URL) throws {
     do {
       try FileManager.default.createDirectory(
         at: url.deletingLastPathComponent(), withIntermediateDirectories: true)

@@ -193,3 +193,26 @@ private func update(_ limits: String) throws -> RateLimitResponse {
   #expect(merged?.rateLimits?.primary == nil)
   #expect(merged?.rateLimits?.secondary?.usedPercent == 12)
 }
+@Test func sparseNotificationDoesNotRefreshStaleWindow() throws {
+  let now: TimeInterval = 1_800_000_000
+  let update = try update(#"{"primary":{"usedPercent":30,"windowDurationMins":300}}"#)
+  let fresh = CodexMeasurement(reading: try fixture("current"), capturedAt: now - 60)
+  let merged = CodexMeasurement.applying(update, to: fresh, at: now, refreshInterval: 60)
+  #expect(merged?.reading.rateLimits?.secondary?.usedPercent == 4)
+  #expect(merged?.capturedAt == now)
+
+  let stale = CodexMeasurement(reading: try fixture("current"), capturedAt: now - 3_600)
+  let restarted = CodexMeasurement.applying(update, to: stale, at: now, refreshInterval: 60)
+  #expect(restarted?.reading.rateLimits?.primary?.usedPercent == 30)
+  #expect(restarted?.reading.rateLimits?.secondary == nil)
+
+  let other = try decode(
+    #"{"rateLimits":{"limitId":"other","primary":{"usedPercent":1,"windowDurationMins":300}}}"#)
+  #expect(CodexMeasurement.applying(other, to: fresh, at: now, refreshInterval: 60) == nil)
+}
+@Test func codexFreshnessFollowsRefreshInterval() throws {
+  let reading = CodexMeasurement(reading: try fixture("current"), capturedAt: 1_000)
+  #expect(reading.isFresh(at: 1_300, refreshInterval: 60))
+  #expect(!reading.isFresh(at: 1_301, refreshInterval: 60))
+  #expect(reading.isFresh(at: 1_600, refreshInterval: 300))
+}
