@@ -61,3 +61,87 @@ swift build -c release
 ```
 
 Les tests utilisent des fixtures synthétiques et un faux serveur local Python 3 ; ils ne nécessitent aucun compte ni accès réseau. Le diagnostic final, facultatif, lit les quotas du compte connecté sans afficher de credential. Les erreurs RPC, arrêts et délais dépassés sont signalés, les mesures en échec sont retirées de l’affichage, et l’actualisation suivante reconnecte le serveur. Les détails bruts des erreurs du serveur ne sont pas affichés.
+
+## Windows — application native dans la zone de notification
+
+La version Windows est séparée dans [`windows/`](windows/ARCHITECTURE.md). Elle utilise **C# / .NET 10 LTS / WinForms NotifyIcon**, sans Electron, WebView, backend ni fenêtre principale. Le code et les instructions macOS ci-dessus restent inchangés. .NET 10 est la version LTS retenue pour cette nouvelle application ([installation officielle](https://learn.microsoft.com/en-us/dotnet/core/install/windows)).
+
+### Prérequis et compilation
+
+- Windows 10/11 **x64** pris en charge par .NET 10 ;
+- pour compiler : **SDK .NET 10**, par exemple `winget install Microsoft.DotNet.SDK.10` ;
+- pour Codex : le CLI Windows installé et connecté à un compte ChatGPT compatible (`codex login`) ;
+- facultatif : Claude Code **2.1.251+** avec des quotas `rate_limits` disponibles pour le compte. Claude n’est pas nécessaire à Codex.
+
+Dans PowerShell, à la racine du repository :
+
+```powershell
+dotnet test
+dotnet build -c Release
+dotnet publish -c Release
+.\artifacts\windows\win-x64\AIQuota.exe
+```
+
+L’exécutable exact est **`artifacts\windows\win-x64\AIQuota.exe`**. Il est publié **self-contained x64**, en fichier unique : aucun runtime .NET séparé n’est nécessaire sur la machine cible. Le runtime Desktop inclus explique la taille du fichier (environ 111 Mio). La compilation/restauration nécessite Internet pour les composants .NET et xUnit ; les tests eux-mêmes utilisent uniquement des fixtures et un faux serveur local, sans compte réel. Un smoke test supplémentaire de l’exécutable publié est disponible : `powershell -NoProfile -File windows/scripts/Smoke.ps1` ; ses données sont isolées dans un dossier temporaire.
+
+Pour installer, copie `AIQuota.exe` dans un dossier utilisateur stable, par exemple `%LOCALAPPDATA%\Programs\AIQuota`, puis lance-le. L’application continue de tourner après fermeture de PowerShell. Windows peut placer l’icône dans le volet des icônes masquées : utilise la flèche de la zone de notification pour la retrouver ou l’épingler. **Quitter** termine l’application. Pour désinstaller, désactive d’abord le lancement automatique et retire, si tu l’as configurée, la commande status line Claude ; quitte ensuite l’application et supprime son dossier.
+
+### Codex CLI
+
+Vérifie d’abord dans PowerShell :
+
+```powershell
+Get-Command codex
+where.exe codex
+codex login
+```
+
+AI Quota recherche `codex.exe`, `codex.cmd` ou `codex.bat` dans le `PATH` hérité. Si nécessaire, il interroge `Get-Command codex` dans Windows PowerShell sans charger de profil, puis vérifie les emplacements utilisateur npm et `.local\bin`. Les shims npm `.cmd` sont pris en charge, y compris avec des espaces dans le chemin. Les fonctions et alias définis uniquement dans un profil PowerShell ne constituent pas un exécutable lançable par l’app : expose le CLI dans `PATH`. Après une installation ou une modification du `PATH`, relance AI Quota.
+
+L’app lance **`codex app-server`**, effectue le handshake et lit **`account/rateLimits/read`**, puis écoute les notifications documentées ([protocole officiel](https://learn.chatgpt.com/docs/app-server)). Elle affiche uniquement le bucket **`codex`** : ce sont les quotas Codex du compte ChatGPT, pas ceux de tous les modèles de conversation ChatGPT. Aucun endpoint HTTP privé, fichier de credential ou token n’est lu par AI Quota. Le CLI gère lui-même sa connexion existante.
+
+### Menu et préférences
+
+Clic gauche ou droit sur l’icône :
+
+- **ChatGPT / Codex** puis **Claude** : quotas 5 h / 7 j, resets, date de chaque mesure, source et état frais / ancien / indisponible ;
+- **Actualiser maintenant** ;
+- **Affichage** : Disponible ou Utilisé ; **Quotas** : les deux fenêtres, seulement 5 h ou seulement 7 j ;
+- **Actualisation automatique** : désactivée, 30 secondes, 1 minute (défaut), 5 minutes ;
+- **Alertes** : désactivées (défaut), sous 10, 20 ou 30 % disponibles ;
+- **Lancer avec Windows**, **Relier Claude Code…**, **Quitter**.
+
+Le tooltip résume ChatGPT, et Claude sur une seconde ligne si la limite native de 127 caractères le permet. Le texte ne s’ajoute pas à la barre des tâches. Les pourcentages anciens sont masqués. Chaque fenêtre Codex conserve sa propre date lors des notifications partielles ; elle devient ancienne après 5 minutes ou deux intervalles d’actualisation si c’est plus long, ou après son reset connu. Les erreurs retirent les valeurs Codex ; la prochaine actualisation reconnecte le serveur. Claude reste indépendant.
+
+Les alertes utilisent les notifications ballon Windows, éventuellement masquées par les réglages Windows ou le mode concentration. Une alerte n’est pas répétée à chaque refresh : la dernière fenêtre/reset signalée est mémorisée par service. Sans reset connu, une nouvelle alerte devient possible après remontée au-dessus du seuil. Aucun seuil personnalisé n’est proposé dans cette première version.
+
+**Lancer avec Windows** ajoute ou retire uniquement la valeur utilisateur `AIQuota` dans `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Aucun droit administrateur n’est nécessaire, et rien n’est activé au premier lancement. Active cette option après avoir placé l’exécutable dans son dossier définitif. Si tu le déplaces, désactive puis réactive l’option depuis le nouvel emplacement.
+
+### Relier Claude Code sous Windows
+
+La [status line officielle prend en charge Windows](https://code.claude.com/docs/en/statusline#windows-configuration) et transmet les fenêtres indépendantes `rate_limits.five_hour` / `seven_day` après une réponse éligible. Dans le menu, **Relier Claude Code…** ajoute la commande uniquement si aucune `statusLine` n’existe dans **`%USERPROFILE%\.claude\settings.json`** (ou dans `CLAUDE_CONFIG_DIR` si défini). Les autres réglages sont conservés. Aucune modification n’est faite avant cette action explicite. Laisse l’exécutable à un emplacement stable avant de le relier.
+
+La commande invoque explicitement Windows PowerShell, ce qui fonctionne aussi lorsque Claude Code utilise Git Bash. Elle lit son JSON sur stdin et appelle `AIQuota.exe --claude-statusline`. L’encodage de la commande protège les espaces et caractères spéciaux du chemin. Une status line existante n’est jamais remplacée : tu peux intégrer manuellement un appel à l’exécutable dans ton script existant, en lui transmettant le même JSON avant d’afficher ton propre résultat. Exemple PowerShell, à adapter au chemin installé :
+
+```powershell
+$json = [Console]::In.ReadToEnd()
+$json | & "$env:LOCALAPPDATA\Programs\AIQuota\AIQuota.exe" --claude-statusline | Out-Null
+# Utiliser ensuite $json pour ta propre ligne de statut.
+```
+
+Seules les données de quota validées sont conservées : pourcentages 0–100, dates de mesure et resets. Aucun credential ni identifiant de session n’est conservé. Une entrée sans quotas efface les anciens pourcentages, tout en gardant les resets et leur date d’observation pour reconnaître une ancienne fenêtre. Claude est ancien après 15 minutes ou après un reset connu ; seuls les resets futurs récemment observés sont affichés. Une première réponse Claude Code éligible est nécessaire pour obtenir des quotas. **Claude Desktop Windows n’est pas pris en charge** : aucun fichier local équivalent fiable n’a été retenu, et aucun fallback n’est inventé.
+
+### Diagnostics et données locales
+
+Un WinExe ne bloque pas toujours PowerShell sans pipeline. Pour attendre la fin et obtenir le résultat :
+
+```powershell
+.\artifacts\windows\win-x64\AIQuota.exe --diagnose-codex | Out-Host
+.\artifacts\windows\win-x64\AIQuota.exe --diagnose-claude | Out-Host
+```
+
+Codex indique le chemin découvert, le succès du handshake, la lecture du bucket et les valeurs/reset disponibles. Claude indique la source, les chemins, les mesures et leur fraîcheur. Codes de sortie : `0` lecture réussie, `1` erreur, `2` absence de mesure exploitable ou option inconnue. Les diagnostics n’affichent ni credentials ni erreurs brutes du serveur. Pour obtenir le code dans un script qui doit attendre explicitement, utilise `Start-Process -Wait -PassThru`.
+
+Les données sont sous **`%LOCALAPPDATA%\AIQuota`** : `preferences.json` (affichage, fréquence, alertes et identités déjà signalées) et `claude-usage.json` (dernière mesure Claude uniquement). Les quotas Codex restent en mémoire. `AIQUOTA_DATA_DIR` permet de remplacer ce dossier, notamment pour des tests isolés. L’option de lancement Windows est lue directement dans la clé utilisateur Run. Aucune donnée n’est envoyée par AI Quota à un backend ou service tiers.
+
+L’audit, l’architecture et les limites de validation sont détaillés dans [`windows/ARCHITECTURE.md`](windows/ARCHITECTURE.md). La CI Windows teste et publie séparément ; la CI macOS existante est conservée.
