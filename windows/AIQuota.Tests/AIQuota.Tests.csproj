@@ -8,6 +8,7 @@
     <ProjectReference Include="../AIQuota.FakeServer/AIQuota.FakeServer.csproj" ReferenceOutputAssembly="false" />
     <None Include="../../Tests/QuotaCoreTests/Fixtures/*.json" Link="Fixtures/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <ItemGroup><Compile Include="../AIQuota/PopupPresentation.cs" Link="PopupPresentation.cs" /></ItemGroup>
   <Target Name="CopyFakeServer" AfterTargets="Build">
     <ItemGroup><FakeFiles Include="../AIQuota.FakeServer/bin/$(Configuration)/$(TargetFramework)/AIQuota.FakeServer.*" /></ItemGroup>
     <Copy SourceFiles="@(FakeFiles)" DestinationFolder="$(OutDir)fake" />

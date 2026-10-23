@@ -12,7 +12,7 @@ internal sealed class TrayContext : ApplicationContext
     private readonly Control dispatch = new();
     private readonly Preferences preferences = Preferences.Load();
     private readonly Icon icon;
-    private readonly Font headingFont;
+    private readonly QuotaPopup popup;
     private readonly CancellationTokenSource stopping = new();
     private CodexClient? client;
     private Quotas codex = new(), claude = new();
@@ -25,10 +25,11 @@ internal sealed class TrayContext : ApplicationContext
     public TrayContext()
     {
         dispatch.CreateControl();
-        headingFont = new Font(menu.Font, FontStyle.Bold);
+        popup = new QuotaPopup(() => _ = RefreshAsync(), () => menu.Show(Cursor.Position));
         icon = MakeIcon();
         tray = new NotifyIcon { Icon = icon, Text = "AI Quota · connexion…", ContextMenuStrip = menu, Visible = true };
-        tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) { ReadClaude(); Render(); menu.Show(Cursor.Position); } };
+        tray.MouseDown += (_, e) => { if (e.Button == MouseButtons.Left) popup.TrayMouseDown(); };
+        tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) { UpdatePopup(); popup.Toggle(Cursor.Position); } };
         menu.Opening += (_, _) => { ReadClaude(); Render(); };
         timer.Tick += async (_, _) =>
         {
@@ -47,7 +48,7 @@ internal sealed class TrayContext : ApplicationContext
     private async Task RefreshAsync()
     {
         if (refreshing || closing) return;
-        refreshing = true;
+        refreshing = true; UpdatePopup();
         try
         {
             if (client == null)
@@ -117,10 +118,6 @@ internal sealed class TrayContext : ApplicationContext
         // A full rebuild is only performed on opening/actions, never while the user navigates.
         foreach (ToolStripItem item in menu.Items.Cast<ToolStripItem>().ToArray()) item.Dispose();
         menu.Items.Clear();
-        Provider("ChatGPT / Codex", codex, CodexAge, codexError, "Codex app-server");
-        menu.Items.Add(new ToolStripSeparator());
-        Provider("Claude", claude, ClaudeBridge.MaxAge, claudeError, "Claude Code · status line");
-        menu.Items.Add(new ToolStripSeparator());
         Add(menu.Items, refreshing ? "Actualisation…" : "Actualiser maintenant", async () => await RefreshAsync()).Enabled = !refreshing;
         var display = new ToolStripMenuItem("Affichage");
         Option(display, "Disponible", !preferences.Used, () => preferences.Used = false);
@@ -150,28 +147,17 @@ internal sealed class TrayContext : ApplicationContext
         UpdateTooltip();
     }
 
-    private void Provider(string name, Quotas quotas, TimeSpan age, string? error, string source)
-    {
-        menu.Items.Add(new ToolStripMenuItem(name) { Enabled = false, Font = headingFont });
-        foreach (var (label, window) in Selected(quotas))
-        {
-            menu.Items.Add(new ToolStripMenuItem($"{label} : {Percentage(window, age)}") { Enabled = false });
-            var reset = window?.VisibleReset(DateTimeOffset.UtcNow, age)?.ToLocalTime().ToString("g") ?? "—";
-            menu.Items.Add(new ToolStripMenuItem($"Reset {label} : {reset}") { Enabled = false });
-            var state = window?.Used == null ? "indisponible" : window.Fresh(DateTimeOffset.UtcNow, age) ? "frais" : "ancien";
-            menu.Items.Add(new ToolStripMenuItem($"Mesure {label} : {window?.CapturedAt.ToLocalTime().ToString("g") ?? "—"} · {state}") { Enabled = false });
-        }
-        menu.Items.Add(new ToolStripMenuItem(error ?? $"Source : {source}") { Enabled = false });
-    }
-
     private IEnumerable<(string Label, QuotaWindow? Window)> Selected(Quotas q)
     {
         if (preferences.Windows != "seven") yield return ("5 h", q.FiveHour);
         if (preferences.Windows != "five") yield return ("7 j", q.SevenDay);
     }
 
+    private void UpdatePopup() => popup.UpdateData(codex, claude, CodexAge, preferences.Used, preferences.Windows, refreshing, codexError != null || claudeError != null);
+
     private void UpdateTooltip()
     {
+        UpdatePopup();
         var text = "ChatGPT " + string.Join(" · ", Selected(codex).Select(w => $"{w.Label} {Percentage(w.Window, CodexAge)}"));
         var second = "\nClaude " + string.Join(" · ", Selected(claude).Select(w => $"{w.Label} {Percentage(w.Window, ClaudeBridge.MaxAge)}"));
         if (text.Length + second.Length <= 127) text += second;
@@ -241,7 +227,7 @@ internal sealed class TrayContext : ApplicationContext
     }
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { tray.Dispose(); menu.Dispose(); headingFont.Dispose(); icon.Dispose(); timer.Dispose(); dispatch.Dispose(); stopping.Dispose(); }
+        if (disposing) { tray.Dispose(); menu.Dispose(); popup.Dispose(); icon.Dispose(); timer.Dispose(); dispatch.Dispose(); stopping.Dispose(); }
         base.Dispose(disposing);
     }
 }

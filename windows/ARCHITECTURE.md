@@ -41,3 +41,13 @@ Quota alerts are disabled by default. The 10/20/30% thresholds apply to availabl
 ## Verification limits
 
 Swift validation remains in the existing macOS CI job; Windows cannot execute the AppKit app. Windows CI separately tests, builds and publishes. A self-contained x64 executable includes the .NET desktop runtime, so it is larger on disk than a framework-dependent build; no runtime installation is required. Native menu/tooltip rendering, Windows scaling, the startup toggle and notifications should also be checked interactively on the target desktop. Tests never enable startup or alter real Claude settings.
+
+## Tray popup presentation
+
+Left-click toggles a reusable borderless WinForms `QuotaPopup` (416 x 470 logical pixels); right-click and the discreet Settings button open the reduced native settings menu. Deactivation or Escape hides the popup. A tray mouse-down records dismissal intent so the deactivation preceding a second tray click does not reopen it.
+
+The popup paints immutable quota snapshots supplied by `TrayContext`; painting and opening perform no quota retrieval or cache reads. The existing timer and notification paths update the snapshot and invalidate only a visible popup. Buttons reuse the existing refresh/settings actions. Percentages follow the display preference; bars always show available quota, explicitly labelled in used mode. Stale percentages are hidden using the existing freshness predicate. Technical error strings never enter the popup.
+
+PerMonitorV2 is enabled through WinForms application configuration. Placement uses the tray click's monitor working area, device DPI and clamped bounds, including negative monitor coordinates. DWM rounding and frame shadow are best effort (Windows 11 supports rounded corners; Windows 10 may remain square). No rendering framework or UI package was added.
+
+Presentation tests cover concise local resets (including daylight-saving changes), stale/missing percentages, relative timestamps and placement at 100/125/150 percent on primary and negative-coordinate secondary monitors. These are geometry tests, not a substitute for interactive Windows 10/11 and mixed-DPI checks. During implementation the Computer Use native pipe was unavailable, so tray clicks, actual rendering and screenshots could not be verified interactively. Release publication used `artifacts/windows/popup/win-x64/` because the previous executable in the default output directory was running.
