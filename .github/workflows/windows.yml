@@ -1,0 +1,22 @@
+name: Windows validation
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Offline-account tests
+        run: dotnet test -c Release
+      - name: Release build
+        run: dotnet build -c Release --no-restore
+      - name: Self-contained x64 publish
+        run: dotnet publish -c Release
+      - name: Published executable smoke test
+        shell: powershell
+        run: ./windows/scripts/Smoke.ps1

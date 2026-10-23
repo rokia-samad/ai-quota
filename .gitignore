@@ -1,3 +1,8 @@
 .DS_Store
 .build/
 AI Quota.app/
+.tools/
+**/bin/
+**/obj/
+**/TestResults/
+artifacts/
