@@ -28,7 +28,7 @@ try {
     $inputJson = '{"session_id":"must-not-be-stored","rate_limits":{"five_hour":{"used_percentage":0,"resets_at":' + $reset + '},"seven_day":{"used_percentage":100}}}'
     $capture = Invoke-Quota '--claude-statusline' $inputJson
     if ($capture.Code -ne 0) { throw "Claude capture failed (exit $($capture.Code)): $($capture.Output) $($capture.Error)" }
-    $script = '$data = [Console]::In.ReadToEnd(); $data | & ''' + $Executable.Replace("'", "''") + ''' --claude-statusline'
+    $script = '$OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::InputEncoding = $OutputEncoding; $data = [Console]::In.ReadToEnd(); $data | & ''' + $Executable.Replace("'", "''") + ''' --claude-statusline'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
     $wrapped = Invoke-Quota "-NoProfile -NonInteractive -EncodedCommand $encoded" $inputJson 'powershell.exe'
     if ($wrapped.Code -ne 0 -or -not $wrapped.Output.Contains('Claude')) { throw 'PowerShell status line wrapper failed' }

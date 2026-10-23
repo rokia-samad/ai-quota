@@ -79,7 +79,9 @@ public static class ClaudeBridge
         JsonElement limits = default;
         try
         {
-            document = JsonDocument.Parse(input);
+            // Windows PowerShell can prefix redirected UTF-8 stdin with a BOM. It is
+            // transport framing, not part of the JSON text; never relax JSON validation.
+            document = JsonDocument.Parse(input.TrimStart('\uFEFF'));
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object) invalid = true;
             limits = root.Property("rate_limits");
@@ -133,7 +135,8 @@ public static class ClaudeBridge
     {
         // Explicit PowerShell wrapper works whether Claude's outer shell is Git Bash or PowerShell.
         var escaped = executable.Replace("'", "''");
-        var script = "$data = [Console]::In.ReadToEnd(); $data | & '" + escaped + "' --claude-statusline";
+        var script = "$OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::InputEncoding = $OutputEncoding; "
+            + "$data = [Console]::In.ReadToEnd(); $data | & '" + escaped + "' --claude-statusline";
         return "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
     }
 

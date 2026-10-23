@@ -50,6 +50,11 @@ public sealed class ClaudeTests : IDisposable
         Assert.Null(w.VisibleReset(Now.AddMinutes(16), ClaudeBridge.MaxAge));
     }
     [Fact] public void MissingCacheIsUnavailable() => Assert.Null(ClaudeBridge.Read(Cache, Now));
+    [Fact] public void WindowsPowerShellUtf8BomIsAccepted()
+    {
+        var reading = ClaudeBridge.Capture("\uFEFF" + Input(), null, Now);
+        Assert.False(reading.Invalid); Assert.Equal(0, reading.Quotas.FiveHour!.Used);
+    }
     [Fact] public void InvalidInputResetsSurviveTheFollowingCapture()
     {
         var previous = ClaudeBridge.Capture(Input(), null, Now);

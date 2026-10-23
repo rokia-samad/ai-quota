@@ -51,6 +51,7 @@ internal static class Program
                     return record?.Quotas is { } q && new[] { q.FiveHour, q.SevenDay }.Any(w =>
                         w?.Used != null && w.Fresh(DateTimeOffset.UtcNow, ClaudeBridge.MaxAge)) ? 0 : 2;
                 case "--claude-statusline":
+                    Console.InputEncoding = new System.Text.UTF8Encoding(false);
                     ClaudeRecord? previous = null;
                     try { previous = ClaudeBridge.Read(LocalData.ClaudeCache, DateTimeOffset.UtcNow, allowInvalid: true); } catch (InvalidDataException) { }
                     // Read only stdin from Claude; retain only validated quota fields.
